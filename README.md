@@ -77,3 +77,7 @@ checked out in another worktree, 5 another author's commit, 6 already
 published, 7 a tag stands on it.
 
 `git reword -h` has the rest.
+
+## License
+
+MIT. See `LICENSE`.
