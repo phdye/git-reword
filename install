@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+#
+# install - place git-reword where git will find it as a subcommand.
+#
+# git finds a subcommand by looking for git-<name> on PATH, so installing is
+# a copy and nothing more.  A copy rather than a symlink because that is how
+# the other tools on this machine sit in ~/.local/bin, and because a symlink
+# into a working tree makes an uncommitted edit take effect everywhere
+# without anybody choosing that.
+#
+# The cost of a copy is that it can go stale against the repository, which is
+# what --verify is for.
+
+set -uo pipefail
+
+PROG=install
+VERSION=1.0.0
+
+read -r -d '' USAGE <<'USAGEEOF'
+Usage:
+  install [options]
+  install --verify [options]
+  install (-h | --help)
+  install (-V | --version)
+
+Copy git-reword to the prefix's bin, so that git finds it as 'git reword'.
+
+Options:
+  -p, --prefix DIR   Install under DIR/bin [default: ~/.local]
+      --verify       Report drift against the repository, change nothing,
+                     exit 1 if any is found
+  -f, --force        Overwrite a file that is not a copy of this one
+      --no-force
+  -n, --dry-run      Say what would change and change nothing
+      --no-dry-run
+  -v, --verbose      Name the paths as well as the outcome
+      --no-verbose
+  -t, --terse        One line
+  -q, --quiet        Errors only
+      --no-quiet
+  -d, --debug        Trace; implies --verbose
+      --no-debug
+      --color WHEN   Colorize diagnostics: always, never, auto [default: auto]
+      --no-color     Alias for --color never
+  -h, --help         This usage, then exit
+  -V, --version      The version, then exit
+
+Environment:
+  INSTALL_PREFIX, INSTALL_FORCE, INSTALL_DRY_RUN, INSTALL_VERBOSE,
+  INSTALL_TERSE, INSTALL_QUIET, INSTALL_DEBUG, INSTALL_COLOR.  An option
+  beats its variable, a variable beats the default.
+
+Exit codes:
+  0  installed, already current, or --verify found no drift
+  1  --verify found drift
+  2  usage error
+  3  the source is not beside this script
+  4  something else is in the way and --force was not given
+USAGEEOF
+
+PREFIX=${INSTALL_PREFIX:-$HOME/.local}
+VERIFY=0
+FORCE=${INSTALL_FORCE:-0}
+DRY=${INSTALL_DRY_RUN:-0}
+VERBOSE=${INSTALL_VERBOSE:-0}
+TERSE=${INSTALL_TERSE:-0}
+QUIET=${INSTALL_QUIET:-0}
+DEBUG=${INSTALL_DEBUG:-0}
+COLOR=${INSTALL_COLOR:-auto}
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        -p|--prefix)   PREFIX=${2:?--prefix needs a directory}; shift 2 ;;
+        --prefix=*)    PREFIX=${1#*=}; shift ;;
+        --verify)      VERIFY=1; shift ;;
+        -f|--force)    FORCE=1; shift ;;
+        --no-force)    FORCE=0; shift ;;
+        -n|--dry-run)  DRY=1; shift ;;
+        --no-dry-run)  DRY=0; shift ;;
+        -v|--verbose)  VERBOSE=1; shift ;;
+        --no-verbose)  VERBOSE=0; shift ;;
+        -t|--terse)    TERSE=1; shift ;;
+        --no-terse)    TERSE=0; shift ;;
+        -q|--quiet)    QUIET=1; shift ;;
+        --no-quiet)    QUIET=0; shift ;;
+        -d|--debug)    DEBUG=1; VERBOSE=1; shift ;;
+        --no-debug)    DEBUG=0; shift ;;
+        --color)       COLOR=${2:?--color needs a value}; shift 2 ;;
+        --color=*)     COLOR=${1#*=}; shift ;;
+        --no-color)    COLOR=never; shift ;;
+        -h|--help)     printf '%s\n' "$USAGE"; exit 0 ;;
+        -V|--version)  printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+        --)            shift; break ;;
+        -[a-zA-Z][a-zA-Z]*)
+            # A bundle: -qv is -q -v.  Split it and go round again.
+            bundle=${1#-}; shift
+            set -- $(printf -- '-%s ' $(echo "$bundle" | fold -w1)) "$@" ;;
+        *) printf '%s: unexpected argument: %s\n' "$PROG" "$1" >&2; exit 2 ;;
+    esac
+done
+
+case $COLOR in
+    always) TTY=1 ;;
+    never)  TTY=0 ;;
+    auto)   if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then TTY=1; else TTY=0; fi ;;
+    *)      printf '%s: --color takes always, never or auto; got %s\n' \
+                "$PROG" "$COLOR" >&2; exit 2 ;;
+esac
+if [ "$TTY" = 1 ]; then C_OK=$'\033[32m'; C_BAD=$'\033[31m'; C_OFF=$'\033[0m'
+else C_OK=; C_BAD=; C_OFF=; fi
+
+LEVEL=2
+[ "$QUIET" = 1 ] && LEVEL=0
+[ "$TERSE" = 1 ] && LEVEL=1
+[ "$VERBOSE" = 1 ] && LEVEL=3
+[ "$DEBUG" = 1 ] && LEVEL=4
+
+say()    { [ "$LEVEL" -ge "${2:-2}" ] && printf '%s\n' "$1" >&2; return 0; }
+detail() { say "$1" 3; }
+die()    { printf '%s%s: %s%s\n' "$C_BAD" "$PROG" "$2" "$C_OFF" >&2
+           shift 2; for l in "$@"; do printf '  %s\n' "$l" >&2; done; exit "$1"; }
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+SRC=$HERE/git-reword
+DST=$PREFIX/bin/git-reword
+
+[ -f "$SRC" ] || die 3 "git-reword is not beside this script" \
+    "looked for: $SRC" \
+    "run ./install from the repository, not from a copy of this file"
+
+detail "source      $SRC"
+detail "destination $DST"
+
+digest() { [ -f "$1" ] && cmd5sum=$(md5sum < "$1") && printf '%s' "${cmd5sum%% *}"; }
+
+WANT=$(digest "$SRC")
+HAVE=$(digest "$DST")
+
+if [ "$VERIFY" = 1 ]; then
+    if [ ! -e "$DST" ]; then
+        printf 'missing  %s\n' "$DST"
+        exit 1
+    fi
+    if [ "$WANT" != "$HAVE" ]; then
+        printf 'differs  %s\n' "$DST"
+        exit 1
+    fi
+    say "${C_OK}current${C_OFF}  $DST"
+    exit 0
+fi
+
+if [ "$WANT" = "$HAVE" ]; then
+    say "${C_OK}already current${C_OFF}  $DST" 1
+    exit 0
+fi
+
+# Anything already there that this script did not put there is left alone.
+# A stray git-reword on PATH is more likely somebody else's work than a
+# stale copy of this one, and overwriting it silently is how that gets lost.
+if [ -e "$DST" ] && [ "$FORCE" != 1 ] && [ -n "$HAVE" ]; then
+    if ! head -1 "$DST" | grep -q '^#!.*python' || \
+       ! grep -q '^PROG = "git-reword"' "$DST"; then
+        die 4 "something else is already at $DST" \
+            "it is not a copy of this tool" \
+            "--force to overwrite it anyway"
+    fi
+fi
+
+if [ "$DRY" = 1 ]; then
+    if [ -e "$DST" ]; then say "would replace  $DST" 1
+    else say "would install  $DST" 1; fi
+    exit 0
+fi
+
+mkdir -p "$PREFIX/bin" || die 1 "cannot make $PREFIX/bin"
+cp -- "$SRC" "$DST" || die 1 "cannot write $DST"
+chmod 755 "$DST" || die 1 "cannot make $DST executable"
+
+if [ "$(digest "$DST")" != "$WANT" ]; then
+    die 1 "the copy at $DST does not match the source" \
+        "a tool reporting success is not proof; this is the proof failing"
+fi
+
+say "${C_OK}installed${C_OFF}  $DST" 1
+case ":$PATH:" in
+    *:"$PREFIX/bin":*) ;;
+    *) say "note: $PREFIX/bin is not on PATH, so 'git reword' will not resolve" 1 ;;
+esac

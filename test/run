@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+#
+# run - the checks.
+#
+# The tool carries its own --self-test rather than a separate harness, because
+# what has to be proved is a property of a real repository -- that a replay
+# changes the message and nothing else -- and the fixture that proves it is a
+# repository with a merge and a side branch in it.  A test file beside the
+# tool would build the same fixture and drive the same entry point, one import
+# further away.
+#
+# This adds what --self-test cannot reach from inside: that the script parses
+# under the interpreter floor, and that the installer's own checks pass.
+
+set -uo pipefail
+
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+FAIL=0
+
+step() { printf '\n== %s\n' "$1"; }
+bad()  { printf '   FAIL %s\n' "$1"; FAIL=1; }
+good() { printf '   ok   %s\n' "$1"; }
+
+step "it compiles"
+if python3 -m py_compile "$HERE/git-reword"; then
+    good "python3 $(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
+else
+    bad "py_compile"
+fi
+
+step "bash scripts parse"
+for f in "$HERE/install" "$HERE/test/run"; do
+    if bash -n "$f"; then good "$(basename "$f")"; else bad "$(basename "$f")"; fi
+done
+
+step "usage and version answer"
+"$HERE/git-reword" --version > /dev/null && good "--version" || bad "--version"
+"$HERE/git-reword" --help | grep -q '^Usage:' && good "--help" || bad "--help"
+
+step "every option in the usage text is one the parser knows"
+# The usage block and the argparse parser are two artifacts and nothing keeps
+# them in sync.  This is the test the CLI standard asks for.
+missing=
+for opt in $(sed -n '/^Options:/,/^$/p' "$HERE/git-reword" \
+             | grep -o -- '--[a-z][a-z-]*' | sort -u); do
+    grep -q -- "\"$opt\"" "$HERE/git-reword" || missing="$missing $opt"
+done
+if [ -z "$missing" ]; then good "no orphan in the usage text"
+else bad "the usage text documents$missing, which the parser does not take"; fi
+
+step "the replay changes the message and nothing else"
+if "$HERE/git-reword" --self-test; then good "--self-test"; else bad "--self-test"; fi
+
+step "the installer dry-runs without writing"
+tmp=$(mktemp -d)
+if "$HERE/install" --prefix "$tmp" --dry-run --terse > /dev/null \
+   && [ ! -e "$tmp/bin/git-reword" ]; then
+    good "--dry-run wrote nothing"
+else
+    bad "--dry-run"
+fi
+if "$HERE/install" --prefix "$tmp" --terse > /dev/null \
+   && "$HERE/install" --prefix "$tmp" --verify --quiet; then
+    good "install, then --verify agrees"
+else
+    bad "install / --verify"
+fi
+printf 'stale\n' >> "$tmp/bin/git-reword"
+if ! "$HERE/install" --prefix "$tmp" --verify --quiet > /dev/null 2>&1; then
+    good "--verify reports drift"
+else
+    bad "--verify missed drift"
+fi
+rm -rf "$tmp"
+
+printf '\n'
+[ "$FAIL" = 0 ] && printf 'all checks passed\n' || printf 'CHECKS FAILED\n'
+exit "$FAIL"

@@ -1,0 +1,20 @@
+measured   2026-09-28.17-27
+host       CYGWIN_NT-10.0 3.0.7(0.338/5/3)
+git        git version 2.43.7
+python     Python 3.6.9
+repository /c/-/repo/elf-sysv-nt-veneer
+
+branch     main
+commits    957, of which 45 are merges
+target     0cb0e2f88109, 208 commits stand on it
+
+warning: rewriting published commits; the remote keeps the old ids until you force push, which is yours to decide
+1 reworded, 208 carried, 1 refs
+
+FINDINGS
+  trees, authors, author dates, committers and committer dates: unchanged
+  parent counts: unchanged, so every merge is still a merge
+  subjects differing: 2 (2 expected: one removed, one added)
+  commit count: 957 before, 957 after
+  merge count: 45 before, 45 after
+  working tree after the replay: 0 paths reported changed

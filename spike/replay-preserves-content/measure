@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+#
+# measure - does rewording a commit deep in a real history change anything
+#           other than the message?
+#
+# The design decision this settles is replay against rebase.  Both change a
+# message; the question is what else moves.  So: clone a repository with real
+# merges in it, reword one commit far enough back that hundreds stand on it,
+# and compare every commit's tree, author, author date, committer, committer
+# date and parent count, position by position, before and against after.
+#
+# Regenerate:
+#   spike/replay-preserves-content/measure <repository> \
+#     > spike/replay-preserves-content/results-$(date +%Y-%m-%d).txt 2>&1
+#
+# The repository is an argument because the answer must not depend on which
+# one: any history with merges in it will do, and the one used for the
+# committed transcript is named in that transcript's header.
+
+set -uo pipefail
+
+SOURCE=${1:?usage: measure <repository> [depth]}
+DEPTH=${2:-200}
+TOOL=$(cd "$(dirname "$0")/../.." && pwd)/git-reword
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+FMT='%T|%an <%ae>|%ad|%cn <%ce>|%cd'
+
+printf 'measured   %s\n' "$(date +%Y-%m-%d.%H-%M)"
+printf 'host       %s %s\n' "$(uname -s)" "$(uname -r)"
+printf 'git        %s\n' "$(git --version)"
+printf 'python     %s\n' "$(python3 -V 2>&1)"
+printf 'repository %s\n' "$SOURCE"
+printf '\n'
+
+git clone --quiet --no-hardlinks --no-local "$SOURCE" "$WORK/r" || exit 1
+cd "$WORK/r" || exit 1
+git config user.name "measurement"
+git config user.email "measurement@example.invalid"
+
+BRANCH=$(git symbolic-ref --short HEAD)
+TOTAL=$(git rev-list --count HEAD)
+MERGES=$(git rev-list --merges --count HEAD)
+TARGET=$(git rev-parse "HEAD~$DEPTH")
+STANDING=$(git rev-list --count "$TARGET"..HEAD)
+
+printf 'branch     %s\n' "$BRANCH"
+printf 'commits    %s, of which %s are merges\n' "$TOTAL" "$MERGES"
+printf 'target     %s, %s commits stand on it\n' "${TARGET:0:12}" "$STANDING"
+printf '\n'
+
+git log --topo-order --format="$FMT" HEAD > "$WORK/before"
+git log --topo-order --format='%p' HEAD | awk '{print NF}' > "$WORK/before-p"
+git log --format=%s HEAD > "$WORK/before-s"
+
+"$TOOL" --published --any-author --terse "$TARGET" \
+        -m 'a subject written by the measurement' || exit 1
+printf '\n'
+
+git log --topo-order --format="$FMT" HEAD > "$WORK/after"
+git log --topo-order --format='%p' HEAD | awk '{print NF}' > "$WORK/after-p"
+git log --format=%s HEAD > "$WORK/after-s"
+
+printf 'FINDINGS\n'
+if cmp -s "$WORK/before" "$WORK/after"; then
+    printf '  trees, authors, author dates, committers and committer dates:'
+    printf ' unchanged\n'
+else
+    printf '  CHANGED -- content did not survive the replay:\n'
+    diff "$WORK/before" "$WORK/after" | head -20 | sed 's/^/    /'
+fi
+
+if cmp -s "$WORK/before-p" "$WORK/after-p"; then
+    printf '  parent counts: unchanged, so every merge is still a merge\n'
+else
+    printf '  CHANGED -- the shape of the history moved:\n'
+    diff "$WORK/before-p" "$WORK/after-p" | head -20 | sed 's/^/    /'
+fi
+
+CHANGED=$(diff "$WORK/before-s" "$WORK/after-s" | grep -c '^[<>]')
+printf '  subjects differing: %s (2 expected: one removed, one added)\n' "$CHANGED"
+printf '  commit count: %s before, %s after\n' \
+    "$TOTAL" "$(git rev-list --count HEAD)"
+printf '  merge count: %s before, %s after\n' \
+    "$MERGES" "$(git rev-list --merges --count HEAD)"
+printf '  working tree after the replay: %s\n' \
+    "$(git status --porcelain | wc -l) paths reported changed"

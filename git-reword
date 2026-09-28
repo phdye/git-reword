@@ -1,0 +1,1254 @@
+#!/usr/bin/env python3
+#
+# git-reword - change the message of a commit that is already written.
+#
+# Rewording is not editing.  A message is part of the object that names the
+# commit, so changing it mints a new commit, and every commit standing on that
+# one has to be minted again.  That is the whole cost, and the decisions here
+# follow from paying it once and being able to see what it bought.
+#
+# The rewrite is a replay, not a rebase.  Each commit is read as a raw object,
+# its parents remapped, its message replaced where one was given, and the
+# result written back.  Nothing is re-applied and nothing is re-merged, so
+# there is no conflict to resolve and no merge resolution to lose -- a rebase
+# re-creates a merge by performing it again, and a merge somebody resolved by
+# hand does not survive that.  Trees are reused by id, so a reworded commit
+# holds byte-identical content to the one it replaces, and the author, the
+# author date, the committer and the committer date are copied rather than
+# taken fresh.  Only the message and the commit ids change.
+#
+# Rewording one commit moves every local branch and tag standing on it, not
+# only the one that happens to be checked out.  Moving a subset is how a
+# repository ends up holding both spellings of the same history, each on its
+# own ref, with nothing to say which is meant.  So the affected refs are found
+# first, named in the plan, and moved together.
+#
+# Two things it refuses rather than does.  A commit somebody else wrote is not
+# reworded, because taking over another author's commit is worse than leaving
+# a message badly worded.  A commit a remote-tracking branch already holds is
+# not reworded either, because publishing that rewrite takes a force push, and
+# that is the operator's call rather than a tool's.  Each has a flag, and
+# neither flag pushes anything.
+#
+# Every ref it moves is copied under refs/reword-backup/<stamp>/ before the
+# move, and the command that puts each one back is printed.
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+PROG = "git-reword"
+VERSION = "1.0.0"
+
+E_OK = 0
+E_FAIL = 1
+E_USAGE = 2
+E_REPO = 3
+E_WORKTREE = 4
+E_AUTHOR = 5
+E_PUBLISHED = 6
+E_TAG = 7
+
+USAGE = """\
+Usage:
+  git-reword [options] COMMIT (-m MSG | -F FILE)
+  git-reword [options] --edit [RANGE]
+  git-reword [options] --from FILE
+  git-reword --list [options] [RANGE]
+  git-reword --self-test
+  git-reword (-h | --help)
+  git-reword (-V | --version)
+
+Change the message of a commit that is already written, along with every
+commit standing on it, and move the local refs that held them.  Content is
+never touched: a reworded commit carries the same tree, author, dates and
+parents as the one it replaces.
+
+Arguments:
+  COMMIT               The commit to reword; anything git resolves
+  RANGE                Which commits to offer for rewording
+                       [default: @{upstream}..HEAD]
+  FILE                 A message file, or a table; '-' is stdin
+
+Options:
+  -m, --message MSG    The new message; repeatable, each one a paragraph
+  -F, --file FILE      Read the new message from FILE
+  -e, --edit           Write the table, open it in the editor, apply it
+      --no-edit
+      --from FILE      Apply a table written earlier
+  -l, --list           Print the table and exit, to be edited elsewhere
+  -o, --output FILE    Where --list writes; '-' is stdout [default: -]
+  -r, --refs PATTERN   Move only refs matching PATTERN; repeatable
+      --any-author     Reword commits this identity did not write
+      --no-any-author
+      --published      Reword commits a remote-tracking branch already holds.
+                       Publishing them afterwards takes a force push, which
+                       this tool does not do and will not help with.
+      --no-published
+      --skip-tags      Leave a tag standing on the old history rather than
+                       refusing to run
+      --no-skip-tags
+  -C, --directory DIR  Run as if started in DIR
+  -n, --dry-run        Print the plan and change nothing
+      --no-dry-run
+      --json           Report as JSON
+      --porcelain      One tab-separated record per line
+  -v, --verbose        Name every commit replayed, not only the reworded ones
+      --no-verbose
+  -t, --terse          One line
+  -q, --quiet          Errors only
+      --no-quiet
+  -d, --debug          Trace the replay; implies --verbose
+      --no-debug
+      --color WHEN     Colorize diagnostics: always, never, auto
+                       [default: auto]
+      --no-color       Alias for --color never
+      --self-test      Replay a repository built for the purpose, then exit
+  -h, --help           This usage, then exit
+  -V, --version        The version, then exit
+
+The table:
+  An entry is a 'commit' line at column zero with the message indented four
+  spaces beneath it.  Edit a message to reword that commit.  Leave one as it
+  stands, or delete the whole entry, and that commit is left alone.  A '#' at
+  column zero is a comment and is dropped; inside a message it is indented,
+  so it is message text.
+
+Environment:
+  GIT_REWORD_REFS, GIT_REWORD_ANY_AUTHOR, GIT_REWORD_PUBLISHED,
+  GIT_REWORD_SKIP_TAGS, GIT_REWORD_DIRECTORY, GIT_REWORD_DRY_RUN,
+  GIT_REWORD_COLOR, GIT_REWORD_VERBOSE, GIT_REWORD_TERSE, GIT_REWORD_QUIET,
+  GIT_REWORD_DEBUG.  An option beats its variable, a variable beats the
+  default.  GIT_EDITOR, VISUAL and EDITOR select the editor for --edit, in
+  that order.
+
+Exit codes:
+  0  the rewrite ran, or --dry-run printed a plan
+  1  the rewrite failed
+  2  usage error
+  3  not a git repository, or a revision that does not resolve
+  4  a ref that must move is checked out in another worktree
+  5  a commit belongs to another author
+  6  a commit is already published
+  7  a tag stands on a commit being reworded
+"""
+
+
+# ------------------------------------------------------------------ output
+
+class Out(object):
+    """Volume and format are separate axes; this holds both."""
+
+    def __init__(self):
+        self.level = 2          # 0 quiet, 1 terse, 2 normal, 3 verbose, 4 debug
+        self.color = False
+
+    def paint(self, text, code):
+        if not self.color:
+            return text
+        return "\033[%sm%s\033[0m" % (code, text)
+
+    def ok(self, text):
+        return self.paint(text, "32")
+
+    def warn_c(self, text):
+        return self.paint(text, "33")
+
+    def bad(self, text):
+        return self.paint(text, "31")
+
+    def dim(self, text):
+        return self.paint(text, "2")
+
+    def say(self, text, level=2):
+        if self.level >= level:
+            sys.stderr.write(text + "\n")
+
+    def note(self, text):
+        self.say(text, 2)
+
+    def detail(self, text):
+        self.say(text, 3)
+
+    def trace(self, text):
+        self.say(self.dim("  . " + text), 4)
+
+    def warn(self, text):
+        self.say(self.warn_c("warning: ") + text, 1)
+
+
+OUT = Out()
+
+
+def die(code, message, detail=None):
+    """State what went wrong, then what a reader needs to find the cause."""
+    sys.stderr.write(OUT.bad("%s: " % PROG) + message + "\n")
+    if detail:
+        for line in detail:
+            sys.stderr.write("  " + line + "\n")
+    sys.exit(code)
+
+
+def want_color(when):
+    if when == "always":
+        return True
+    if when == "never":
+        return False
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    return sys.stderr.isatty()
+
+
+# --------------------------------------------------------------------- git
+
+class Git(object):
+    """Every git call goes through here, so the cwd is stated once and the
+    failures all read the same way."""
+
+    def __init__(self, cwd):
+        self.cwd = cwd
+
+    def run(self, args, stdin=None, check=True):
+        OUT.trace("git " + " ".join(args))
+        proc = subprocess.Popen(
+            ["git"] + args,
+            cwd=self.cwd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        out, err = proc.communicate(stdin)
+        if check and proc.returncode != 0:
+            die(E_FAIL,
+                "git %s failed" % " ".join(args),
+                [("rc %d" % proc.returncode),
+                 ("in " + self.cwd)] +
+                err.decode("utf-8", "replace").splitlines())
+        return proc.returncode, out, err
+
+    def text(self, args, check=True):
+        rc, out, _ = self.run(args, check=check)
+        return out.decode("utf-8", "replace").strip()
+
+    def lines(self, args, check=True):
+        text = self.text(args, check=check)
+        return [l for l in text.split("\n") if l]
+
+    def raw(self, args, stdin=None, check=True):
+        rc, out, _ = self.run(args, stdin=stdin, check=check)
+        return out
+
+    def ok(self, args):
+        rc, _, _ = self.run(args, check=False)
+        return rc == 0
+
+
+def open_repo(directory):
+    cwd = directory or os.getcwd()
+    if not os.path.isdir(cwd):
+        die(E_REPO, "no such directory: %s" % cwd,
+            ["given by --directory or %s_DIRECTORY" % PROG.upper().replace("-", "_")])
+    probe = Git(cwd)
+    rc, out, err = probe.run(["rev-parse", "--show-toplevel"], check=False)
+    if rc != 0:
+        die(E_REPO, "not a git repository: %s" % cwd,
+            err.decode("utf-8", "replace").splitlines() +
+            ["run from inside a work tree, or name one with -C"])
+    top = out.decode("utf-8", "replace").strip()
+    return Git(top), top
+
+
+# ---------------------------------------------------------- commit objects
+#
+# A commit object is header lines, a blank line, then the message.  A header
+# may continue over several lines, each continuation beginning with a space,
+# which is how a signature fits in one.  The first blank line is therefore
+# still the boundary, because a continuation line carrying nothing is written
+# as a single space rather than as nothing at all.
+
+IDENT = re.compile(r"^(?P<name>.*?) <(?P<email>[^>]*)> (?P<when>\d+ [+-]\d{4})$")
+
+
+class Commit(object):
+
+    def __init__(self, sha, raw):
+        self.sha = sha
+        head, _, self.body = raw.partition(b"\n\n")
+        self.header = head.split(b"\n")
+
+    def blocks(self):
+        """Header lines grouped with their continuations."""
+        groups = []
+        for line in self.header:
+            if line.startswith(b" ") and groups:
+                groups[-1].append(line)
+            else:
+                groups.append([line])
+        return groups
+
+    def value(self, key):
+        want = key.encode("ascii") + b" "
+        for line in self.header:
+            if line.startswith(want):
+                return line[len(want):].decode("utf-8", "replace")
+        return None
+
+    def values(self, key):
+        want = key.encode("ascii") + b" "
+        return [l[len(want):].decode("utf-8", "replace")
+                for l in self.header if l.startswith(want)]
+
+    @property
+    def parents(self):
+        return self.values("parent")
+
+    @property
+    def tree(self):
+        return self.value("tree")
+
+    def author_email(self):
+        m = IDENT.match(self.value("author") or "")
+        return m.group("email") if m else None
+
+    def author_name(self):
+        m = IDENT.match(self.value("author") or "")
+        return m.group("name") if m else None
+
+    def author_date(self):
+        m = IDENT.match(self.value("author") or "")
+        if not m:
+            return ""
+        stamp = int(m.group("when").split()[0])
+        return time.strftime("%Y-%m-%d", time.localtime(stamp))
+
+    def message(self):
+        return self.body.decode("utf-8", "replace")
+
+    def subject(self):
+        return self.message().split("\n", 1)[0]
+
+
+def rebuild(git, commit, new_parents, new_message):
+    """Write the commit again with these parents and, where one is given,
+    this message.  Everything else is carried across as it stands."""
+    drop = set()
+    if new_message is not None:
+        # The encoding header describes the old message bytes.  A replacement
+        # arrives as UTF-8, so the header would then be a lie about the object
+        # it sits in, and git would decode the message wrongly on the way out.
+        drop.add(b"encoding")
+    # A signature covers the bytes of the commit it was made over.  Rewritten,
+    # those bytes are gone and the signature verifies nothing; git reports it
+    # as a bad signature rather than as an absent one, which is worse.
+    drop.add(b"gpgsig")
+    drop.add(b"gpgsig-sha256")
+    if new_parents != commit.parents:
+        # A mergetag records the tag that was merged, by id.  Re-parented, it
+        # names an object no longer in this history.
+        drop.add(b"mergetag")
+
+    out = []
+    for group in commit.blocks():
+        key = group[0].split(b" ", 1)[0]
+        if key in drop:
+            continue
+        if key == b"parent":
+            continue
+        out.extend(group)
+        if key == b"tree":
+            for parent in new_parents:
+                out.append(b"parent " + parent.encode("ascii"))
+
+    if new_message is None:
+        body = commit.body
+    else:
+        body = new_message.rstrip("\n").encode("utf-8") + b"\n"
+
+    raw = b"\n".join(out) + b"\n\n" + body
+    sha = git.raw(["hash-object", "-t", "commit", "-w", "--stdin"],
+                  stdin=raw).decode("ascii").strip()
+    return sha
+
+
+def read_commits(git, shas):
+    """One cat-file for the lot.  A subprocess per commit is the difference
+    between a second and a minute on a history of any size."""
+    if not shas:
+        return {}
+    stdin = ("\n".join(shas) + "\n").encode("ascii")
+    blob = git.raw(["cat-file", "--batch"], stdin=stdin)
+    found = {}
+    pos = 0
+    for sha in shas:
+        eol = blob.index(b"\n", pos)
+        head = blob[pos:eol].decode("ascii").split()
+        if len(head) != 3 or head[1] != "commit":
+            die(E_FAIL, "cat-file did not return a commit for %s" % sha,
+                ["it said: " + " ".join(head)])
+        size = int(head[2])
+        start = eol + 1
+        found[sha] = Commit(sha, blob[start:start + size])
+        pos = start + size + 1
+    return found
+
+
+# ------------------------------------------------------------------- table
+
+TABLE_HEAD = """\
+# %s -- edit the messages below, save, and close the editor.
+#
+# An entry is a 'commit' line at column zero with its message indented four
+# spaces.  Change a message to reword that commit.  Leave it as it stands, or
+# delete the entry entirely, and the commit is left alone.  A '#' at column
+# zero is a comment; inside a message it is indented, so it is message text.
+#
+# Nothing is written until the editor exits.  An empty table changes nothing.
+"""
+
+ENTRY = re.compile(r"^commit ([0-9a-fA-F]{4,40})\b")
+
+
+def render_table(commits, order):
+    out = [TABLE_HEAD % PROG]
+    for sha in order:
+        commit = commits[sha]
+        out.append("")
+        out.append("commit %s  %s  %s" % (
+            sha[:12], commit.author_date(), commit.author_name() or "?"))
+        for line in commit.message().rstrip("\n").split("\n"):
+            # Not rstrip'd.  A message line ending in a space is common in
+            # this history -- Azure DevOps writes one on every generated
+            # subject -- and trimming it here makes the entry come back
+            # changed, so a commit nobody edited is reworded for nothing.
+            out.append(("    " + line) if line else "")
+    return "\n".join(out) + "\n"
+
+
+def parse_table(text):
+    """Return [(abbrev, message)] in the order the file gives them."""
+    entries = []
+    current = None
+    for line in text.split("\n"):
+        match = ENTRY.match(line)
+        if match:
+            current = [match.group(1).lower(), []]
+            entries.append(current)
+            continue
+        if line.startswith("#"):
+            continue
+        if current is None:
+            if line.strip():
+                die(E_USAGE, "table text before the first commit line",
+                    ["the line was: " + line,
+                     "an entry begins with 'commit <sha>' at column zero"])
+            continue
+        if line.startswith("    "):
+            current[1].append(line[4:])
+        elif not line.strip():
+            current[1].append("")
+        else:
+            die(E_USAGE, "a message line is not indented four spaces",
+                ["the line was: " + line,
+                 "under commit " + current[0]])
+    out = []
+    for sha, body in entries:
+        message = "\n".join(body).strip("\n")
+        if not message.strip():
+            die(E_USAGE, "the message for %s is empty" % sha,
+                ["delete the whole entry to leave that commit alone"])
+        out.append((sha, message + "\n"))
+    return out
+
+
+# -------------------------------------------------------------------- refs
+
+def local_refs(git):
+    """(refname, commit, is_annotated_tag) for every local branch and tag."""
+    fmt = "%(refname)\t%(objecttype)\t%(objectname)\t%(*objectname)"
+    rows = []
+    for line in git.lines(["for-each-ref", "--format=" + fmt,
+                           "refs/heads", "refs/tags"]):
+        field = line.split("\t")
+        while len(field) < 4:
+            field.append("")
+        name, kind, obj, peeled = field[0], field[1], field[2], field[3]
+        rows.append((name, peeled or obj, kind == "tag"))
+    return rows
+
+
+def remote_refs(git):
+    return git.lines(["for-each-ref", "--format=%(refname)", "refs/remotes"])
+
+
+def contains(git, tip, sha):
+    """Does the history behind tip hold sha."""
+    return git.ok(["merge-base", "--is-ancestor", sha, tip])
+
+
+def same_path(a, b):
+    return os.path.normcase(os.path.abspath(a)) == \
+        os.path.normcase(os.path.abspath(b))
+
+
+def other_worktree_branches(git, top):
+    """Branches checked out somewhere other than here.  Moving one leaves
+    that worktree's index describing a commit its branch no longer names,
+    and git reports the whole tree as changed."""
+    held = {}
+    path = None
+    for line in git.lines(["worktree", "list", "--porcelain"]):
+        if line.startswith("worktree "):
+            path = line[len("worktree "):]
+        elif line.startswith("branch ") and path is not None:
+            if not same_path(path, top):
+                held[line[len("branch "):]] = path
+    return held
+
+
+def glob_match(pattern, name):
+    import fnmatch
+    if fnmatch.fnmatch(name, pattern):
+        return True
+    short = name.split("/", 2)[-1]
+    return fnmatch.fnmatch(short, pattern)
+
+
+# -------------------------------------------------------------------- plan
+
+class Plan(object):
+
+    def __init__(self):
+        self.targets = {}       # sha -> new message
+        self.target_order = []  # oldest first
+        self.branches = []      # (refname, old sha)
+        self.tags = []          # (refname, old sha, annotated)
+        self.order = []         # every commit walked, oldest first
+        self.dirty = []         # the ones that must be written again
+        self.mapping = {}       # old sha -> new sha, filled by apply()
+        self.commits = {}
+        self.detached = None    # HEAD's commit, when HEAD is not on a branch
+
+
+def resolve(git, rev):
+    rc, out, err = git.run(["rev-parse", "--verify", "--quiet",
+                            "%s^{commit}" % rev], check=False)
+    sha = out.decode("ascii", "replace").strip()
+    if rc != 0 or not sha:
+        die(E_REPO, "no commit named %s" % rev,
+            ["git rev-parse could not resolve it in " + git.cwd])
+    return sha
+
+
+def exclusions(git, targets):
+    """The parents to cut the walk at.  A parent that itself stands on a
+    target is not one of them: cutting there would take that target out of
+    the walk, and it would be left unreworded without a word said."""
+    out = []
+    for sha in targets:
+        for parent in git.lines(["rev-list", "--parents", "-n", "1", sha])[0].split()[1:]:
+            if parent in targets:
+                continue
+            if any(git.ok(["merge-base", "--is-ancestor", t, parent])
+                   for t in targets):
+                continue
+            if parent not in out:
+                out.append(parent)
+    return out
+
+
+def build_plan(git, top, wanted, opt):
+    plan = Plan()
+    for rev, message in wanted:
+        sha = resolve(git, rev)
+        if sha in plan.targets:
+            die(E_USAGE, "%s named twice" % rev,
+                ["it resolves to " + sha,
+                 "a commit takes one message"])
+        plan.targets[sha] = message
+        plan.target_order.append(sha)
+
+    refs = local_refs(git)
+    for name, sha, annotated in refs:
+        if not any(contains(git, sha, t) for t in plan.targets):
+            continue
+        if opt.refs and not any(glob_match(p, name) for p in opt.refs):
+            OUT.detail("not moving %s: no --refs pattern matches it" % name)
+            continue
+        if name.startswith("refs/tags/"):
+            plan.tags.append((name, sha, annotated))
+        else:
+            plan.branches.append((name, sha))
+
+    if not git.text(["symbolic-ref", "--quiet", "HEAD"], check=False):
+        head = git.text(["rev-parse", "HEAD"])
+        if any(contains(git, head, t) for t in plan.targets):
+            plan.detached = head
+    return plan
+
+
+def check(git, top, plan, opt):
+    """Everything that should stop the run, found before anything is written."""
+    if not plan.branches and not plan.tags and not plan.detached:
+        die(E_FAIL, "no local ref stands on any of those commits",
+            ["nothing would move, so nothing was written"] +
+            ["  " + s[:12] for s in plan.target_order] +
+            ["a --refs pattern that matches nothing does this too"
+             if opt.refs else
+             "the commits may be reachable only from a remote-tracking ref"])
+
+    held = other_worktree_branches(git, top)
+    blocked = [(n, held[n]) for n, _ in plan.branches if n in held]
+    if blocked:
+        die(E_WORKTREE,
+            "a branch that must move is checked out in another worktree",
+            ["%s in %s" % (n, p) for n, p in blocked] +
+            ["that worktree's index would describe a commit its branch no",
+             "longer names, and git would report the tree as wholly changed",
+             "close it, or move it off the branch, then run again"])
+
+    if plan.tags and not opt.skip_tags:
+        die(E_TAG, "a tag stands on a commit being reworded",
+            ["%s -> %s" % (n, s[:12]) for n, s, _ in plan.tags] +
+            ["a tag is a promise that an id will not move, so this tool does",
+             "not move one and will not retag for you",
+             "--skip-tags leaves them naming the history as it stands now,",
+             "which keeps the pre-rewrite commits reachable and alive"])
+
+    mine = git.text(["config", "--get", "user.email"], check=False)
+    theirs = []
+    for sha in plan.target_order:
+        commit = plan.commits[sha]
+        email = commit.author_email()
+        if mine and email and email.lower() != mine.lower():
+            theirs.append((sha, commit.author_name(), email))
+    if theirs and not opt.any_author:
+        die(E_AUTHOR, "a commit being reworded belongs to another author",
+            ["%s  %s <%s>" % (s[:12], n, e) for s, n, e in theirs] +
+            ["this repository's identity is <%s>" % (mine or "unset"),
+             "rewording puts your name on somebody else's words",
+             "--any-author if that is what you mean"])
+
+    published = []
+    remotes = remote_refs(git)
+    for sha in plan.target_order:
+        holders = [r for r in remotes if contains(git, r, sha)]
+        if holders:
+            published.append((sha, holders))
+    if published and not opt.published:
+        detail = []
+        for sha, holders in published:
+            detail.append("%s  on %s" % (sha[:12], ", ".join(holders)))
+        die(E_PUBLISHED, "a commit being reworded is already published",
+            detail +
+            ["the remote holds the old id, so publishing the new one takes a",
+             "force push; this tool does not force push and will not help",
+             "--published rewrites locally anyway, and still pushes nothing"])
+    if published and opt.published:
+        OUT.warn("rewriting published commits; the remote keeps the old ids "
+                 "until you force push, which is yours to decide")
+
+
+def walk(git, plan):
+    """Every commit that has to be written again: the targets, and whatever
+    stands on them.  A commit merged in alongside is walked and left as it
+    is, since its own parents did not move."""
+    tips = [sha for _, sha in plan.branches] + [s for _, s, _ in plan.tags]
+    if plan.detached:
+        tips.append(plan.detached)
+    cut = exclusions(git, plan.target_order)
+    args = ["rev-list", "--topo-order", "--reverse", "--parents"] + tips
+    if cut:
+        args += ["--not"] + cut
+
+    parents = {}
+    for line in git.lines(args):
+        field = line.split()
+        plan.order.append(field[0])
+        parents[field[0]] = field[1:]
+
+    missing = [s for s in plan.target_order if s not in parents]
+    if missing:
+        die(E_FAIL, "the walk did not reach every commit named",
+            ["missing: " + ", ".join(s[:12] for s in missing)] +
+            ["cut at: " + (", ".join(s[:12] for s in cut) or "nothing")] +
+            ["this is a defect in this tool, not in the repository"])
+
+    dirty = set()
+    for sha in plan.order:
+        if sha in plan.targets or any(p in dirty for p in parents[sha]):
+            dirty.add(sha)
+    plan.dirty = [s for s in plan.order if s in dirty]
+    plan.commits.update(read_commits(
+        git, [s for s in plan.dirty if s not in plan.commits]))
+    return plan
+
+
+def apply(git, plan, stamp):
+    for sha in plan.dirty:
+        commit = plan.commits[sha]
+        new_parents = [plan.mapping.get(p, p) for p in commit.parents]
+        new = rebuild(git, commit, new_parents, plan.targets.get(sha))
+        plan.mapping[sha] = new
+        OUT.trace("%s -> %s  %s" % (sha[:12], new[:12], commit.subject()))
+
+    commands = []
+    moved = []
+    for name, old in plan.branches:
+        new = plan.mapping.get(old, old)
+        if new == old:
+            continue
+        commands.append("create refs/reword-backup/%s/%s %s"
+                        % (stamp, name[len("refs/"):], old))
+        commands.append("update %s %s %s" % (name, new, old))
+        moved.append((name, old, new))
+
+    head = git.text(["symbolic-ref", "--quiet", "HEAD"], check=False)
+    if not head:
+        old = git.text(["rev-parse", "HEAD"])
+        new = plan.mapping.get(old, old)
+        if new != old:
+            commands.append("update HEAD %s %s" % (new, old))
+            moved.append(("HEAD", old, new))
+
+    if commands:
+        git.raw(["update-ref", "--stdin"],
+                stdin=("\n".join(commands) + "\n").encode("ascii"))
+    return moved
+
+
+# ------------------------------------------------------------------ report
+
+def report(plan, moved, stamp, opt, write):
+    carried = len(plan.dirty) - len(plan.targets)
+
+    if opt.json:
+        write(json.dumps({
+            "reworded": [{"old": s, "new": plan.mapping.get(s, ""),
+                          "was": plan.commits[s].subject(),
+                          "subject": plan.targets[s].split("\n", 1)[0]}
+                         for s in plan.target_order],
+            "carried": carried,
+            "refs": [{"ref": n, "old": o, "new": w} for n, o, w in moved],
+            "backup": "refs/reword-backup/%s/" % stamp,
+            "dry_run": opt.dry_run,
+        }, indent=2, sort_keys=True) + "\n")
+        return
+
+    if opt.porcelain:
+        for sha in plan.target_order:
+            write("reword\t%s\t%s\n" % (sha, plan.mapping.get(sha, "")))
+        for name, old, new in moved:
+            write("ref\t%s\t%s\t%s\n" % (name, old, new))
+        return
+
+    if opt.level <= 0:
+        return
+
+    if opt.level == 1:
+        write("%d reworded, %d carried, %d refs%s\n"
+              % (len(plan.targets), carried, len(moved),
+                 " (dry run)" if opt.dry_run else ""))
+        return
+
+    verb = "would reword" if opt.dry_run else "reworded"
+    write("%s %d commit%s, carrying %d that stand%s on them:\n"
+          % (verb, len(plan.targets), "" if len(plan.targets) == 1 else "s",
+             carried, "s" if carried == 1 else ""))
+    for sha in plan.target_order:
+        new = plan.mapping.get(sha)
+        # The new subject, not the old one.  A plan is read to decide whether
+        # to go ahead, and what it is going ahead to write is the point.
+        write("  %s%s  %s\n" % (
+            sha[:12],
+            (" -> " + new[:12]) if new else "",
+            plan.targets[sha].split("\n", 1)[0]))
+
+    if opt.level >= 3:
+        write("\ncarried:\n")
+        for sha in plan.dirty:
+            if sha in plan.targets:
+                continue
+            new = plan.mapping.get(sha)
+            write("  %s%s  %s\n" % (
+                sha[:12], (" -> " + new[:12]) if new else "",
+                plan.commits[sha].subject()))
+
+    write("\n%s:\n" % ("refs that would move" if opt.dry_run else "refs moved"))
+    for name, old, new in moved:
+        write("  %-40s %s%s\n"
+              % (name, old[:12], (" -> " + new[:12]) if new else ""))
+
+    if not opt.dry_run and moved:
+        write("\nto put it back:\n")
+        for name, old, new in moved:
+            write("  git update-ref %s %s %s\n" % (name, old, new))
+        write("\nthe old values are also at refs/reword-backup/%s/\n" % stamp)
+
+
+# ------------------------------------------------------------------- modes
+
+def range_commits(git, rng):
+    """Oldest first, the way a rebase todo reads.  A bare revision is taken
+    as its exclusive lower bound, which is the habit git rebase already
+    teaches: 'git reword --edit HEAD~5' offers the last five."""
+    if ".." not in rng:
+        rng = "%s..HEAD" % rng
+    shas = git.lines(["rev-list", "--reverse", rng])
+    if not shas:
+        die(E_FAIL, "%s names no commits" % rng, [])
+    return shas
+
+
+def default_range(git):
+    upstream = git.text(["rev-parse", "--verify", "--quiet",
+                         "--abbrev-ref", "@{upstream}"], check=False)
+    if not upstream:
+        die(E_USAGE, "no RANGE given and this branch has no upstream",
+            ["the default range is @{upstream}..HEAD, which needs one",
+             "name a range, or a revision to count back from:",
+             "  %s --edit HEAD~5" % PROG,
+             "  %s --edit origin/main..HEAD" % PROG])
+    return "%s..HEAD" % upstream
+
+
+def read_message_file(path):
+    if path == "-":
+        return sys.stdin.read()
+    try:
+        with open(path, "r") as handle:
+            return handle.read()
+    except IOError as error:
+        die(E_USAGE, "cannot read %s" % path, [str(error)])
+
+
+def editor_on(git, path):
+    editor = git.text(["var", "GIT_EDITOR"])
+    OUT.detail("editor: %s" % editor)
+    rc = subprocess.call('%s "%s"' % (editor, path), shell=True, cwd=git.cwd)
+    if rc != 0:
+        die(E_FAIL, "the editor exited %d; nothing was written" % rc,
+            ["the table is still at " + path])
+
+
+def changed_only(git, pairs):
+    """Keep the entries whose message the editor actually altered.  An
+    unchanged entry is not a no-op rewrite, it is a commit to leave alone --
+    rewriting it would change its id for nothing."""
+    wanted = []
+    for abbrev, message in pairs:
+        sha = resolve(git, abbrev)
+        commit = read_commits(git, [sha])[sha]
+        if commit.message().strip("\n") == message.strip("\n"):
+            OUT.detail("unchanged, left alone: %s  %s"
+                       % (sha[:12], commit.subject()))
+            continue
+        wanted.append((sha, message))
+    return wanted
+
+
+# ----------------------------------------------------------------- options
+
+ENV = "GIT_REWORD_"
+
+
+def env_bool(name):
+    raw = os.environ.get(ENV + name)
+    if raw is None:
+        return None
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def env_str(name):
+    return os.environ.get(ENV + name)
+
+
+def settle(flag, name, fallback=False):
+    """Option beats variable, variable beats default."""
+    if flag is not None:
+        return flag
+    from_env = env_bool(name)
+    if from_env is not None:
+        return from_env
+    return fallback
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog=PROG, add_help=False)
+    parser.add_argument("rev", nargs="?")
+    parser.add_argument("-m", "--message", action="append", default=[])
+    parser.add_argument("-F", "--file")
+    parser.add_argument("-e", "--edit", dest="edit",
+                        action="store_true", default=None)
+    parser.add_argument("--no-edit", dest="edit", action="store_false")
+    parser.add_argument("--from", dest="from_file")
+    parser.add_argument("-l", "--list", dest="list_only",
+                        action="store_true", default=None)
+    parser.add_argument("--no-list", dest="list_only", action="store_false")
+    parser.add_argument("-o", "--output", default=None)
+    parser.add_argument("-r", "--refs", action="append", default=None)
+    parser.add_argument("--any-author", dest="any_author",
+                        action="store_true", default=None)
+    parser.add_argument("--no-any-author", dest="any_author",
+                        action="store_false")
+    parser.add_argument("--published", dest="published",
+                        action="store_true", default=None)
+    parser.add_argument("--no-published", dest="published",
+                        action="store_false")
+    parser.add_argument("--skip-tags", dest="skip_tags",
+                        action="store_true", default=None)
+    parser.add_argument("--no-skip-tags", dest="skip_tags",
+                        action="store_false")
+    parser.add_argument("-C", "--directory", default=None)
+    parser.add_argument("-n", "--dry-run", dest="dry_run",
+                        action="store_true", default=None)
+    parser.add_argument("--no-dry-run", dest="dry_run", action="store_false")
+    parser.add_argument("--json", action="store_true", default=False)
+    parser.add_argument("--porcelain", action="store_true", default=False)
+    parser.add_argument("-v", "--verbose", dest="verbose",
+                        action="store_true", default=None)
+    parser.add_argument("--no-verbose", dest="verbose", action="store_false")
+    parser.add_argument("-t", "--terse", dest="terse",
+                        action="store_true", default=None)
+    parser.add_argument("--no-terse", dest="terse", action="store_false")
+    parser.add_argument("-q", "--quiet", dest="quiet",
+                        action="store_true", default=None)
+    parser.add_argument("--no-quiet", dest="quiet", action="store_false")
+    parser.add_argument("-d", "--debug", dest="debug",
+                        action="store_true", default=None)
+    parser.add_argument("--no-debug", dest="debug", action="store_false")
+    parser.add_argument("--color", default=None)
+    parser.add_argument("--no-color", dest="color",
+                        action="store_const", const="never")
+    parser.add_argument("--self-test", action="store_true", default=False)
+    parser.add_argument("-h", "--help", action="store_true", default=False)
+    parser.add_argument("-V", "--version", action="store_true", default=False)
+    return parser
+
+
+def settle_all(opt):
+    opt.debug = settle(opt.debug, "DEBUG")
+    opt.verbose = settle(opt.verbose, "VERBOSE")
+    opt.terse = settle(opt.terse, "TERSE")
+    opt.quiet = settle(opt.quiet, "QUIET")
+    opt.dry_run = settle(opt.dry_run, "DRY_RUN")
+    opt.any_author = settle(opt.any_author, "ANY_AUTHOR")
+    opt.published = settle(opt.published, "PUBLISHED")
+    opt.skip_tags = settle(opt.skip_tags, "SKIP_TAGS")
+
+    if opt.debug:
+        opt.level = 4
+    elif opt.verbose:
+        opt.level = 3
+    elif opt.terse:
+        opt.level = 1
+    elif opt.quiet:
+        opt.level = 0
+    else:
+        opt.level = 2
+
+    when = opt.color or env_str("COLOR") or "auto"
+    if when not in ("always", "never", "auto"):
+        die(E_USAGE, "--color takes always, never or auto",
+            ["it was given: " + when])
+    OUT.color = want_color(when)
+    OUT.level = opt.level
+
+    if opt.json and opt.porcelain:
+        die(E_USAGE, "--json and --porcelain are two encodings of one thing",
+            ["give one of them"])
+
+    if opt.refs is None:
+        from_env = env_str("REFS")
+        opt.refs = [p for p in from_env.split(",") if p] if from_env else []
+    if opt.directory is None:
+        opt.directory = env_str("DIRECTORY")
+    if opt.output is None:
+        opt.output = "-"
+    return opt
+
+
+def gather(git, opt):
+    """The commits to reword and what to say about each, whichever way the
+    caller chose to say it."""
+    if opt.from_file:
+        text = read_message_file(opt.from_file)
+        return changed_only(git, parse_table(text))
+
+    if opt.edit:
+        rng = opt.rev or default_range(git)
+        shas = range_commits(git, rng)
+        commits = read_commits(git, shas)
+        path = os.path.join(git.text(["rev-parse", "--absolute-git-dir"]),
+                            "REWORD_TODO")
+        with open(path, "w") as handle:
+            handle.write(render_table(commits, shas))
+        editor_on(git, path)
+        with open(path, "r") as handle:
+            return changed_only(git, parse_table(handle.read()))
+
+    if not opt.rev:
+        die(E_USAGE, "name a commit to reword", ["%s --help" % PROG])
+    if opt.message and opt.file:
+        die(E_USAGE, "-m and -F both give the message", ["give one of them"])
+    if opt.message:
+        message = "\n\n".join(opt.message) + "\n"
+    elif opt.file:
+        message = read_message_file(opt.file)
+    else:
+        die(E_USAGE, "no message given for %s" % opt.rev,
+            ["-m MSG, -F FILE, or --edit to work through a range"])
+    return changed_only(git, [(opt.rev, message)])
+
+
+def emit(opt):
+    if opt.output == "-":
+        return sys.stdout.write
+    handle = open(opt.output, "w")
+    return handle.write
+
+
+def main(argv):
+    opt = build_parser().parse_args(argv)
+    if opt.help:
+        sys.stdout.write(USAGE)
+        return E_OK
+    if opt.version:
+        sys.stdout.write("%s %s\n" % (PROG, VERSION))
+        return E_OK
+    opt = settle_all(opt)
+    if opt.self_test:
+        return self_test()
+
+    chosen = [bool(opt.edit), bool(opt.from_file), bool(opt.list_only)]
+    if sum(1 for c in chosen if c) > 1:
+        die(E_USAGE, "--edit, --from and --list are three ways to start",
+            ["give one of them"])
+
+    git, top = open_repo(opt.directory)
+    OUT.detail("repository: " + top)
+
+    if opt.list_only:
+        rng = opt.rev or default_range(git)
+        shas = range_commits(git, rng)
+        emit(opt)(render_table(read_commits(git, shas), shas))
+        return E_OK
+
+    wanted = gather(git, opt)
+    if not wanted:
+        OUT.note("nothing to reword; no message differs from the one it has")
+        return E_OK
+
+    if git.text(["status", "--porcelain"], check=False):
+        # The replay never touches the index or the working tree -- a
+        # reworded commit holds the same tree -- so this is worth saying and
+        # not worth refusing over.
+        OUT.warn("the working tree has changes; they are left as they are")
+
+    plan = build_plan(git, top, wanted, opt)
+    plan.commits.update(read_commits(git, plan.target_order))
+    check(git, top, plan, opt)
+    walk(git, plan)
+
+    stamp = time.strftime("%Y-%m-%d.%H-%M-%S")
+    if opt.dry_run:
+        moved = [(name, old, "") for name, old in plan.branches]
+        if plan.detached:
+            moved.append(("HEAD", plan.detached, ""))
+    else:
+        moved = apply(git, plan, stamp)
+    report(plan, moved, stamp, opt, emit(opt))
+    return E_OK
+
+
+# --------------------------------------------------------------- self-test
+#
+# The claim worth testing is the one the whole design rests on: that a replay
+# changes the message and nothing else.  So the fixture carries the two cases
+# a rebase would get wrong -- a merge, and a side branch that must not be
+# touched -- and every tree is compared by id before and after.
+
+FIXTURE_AUTHOR = ("A Person", "person@example.invalid")
+FIXTURE_OTHER = ("Someone Else", "else@example.invalid")
+
+
+class Case(object):
+
+    def __init__(self):
+        self.failed = []
+
+    def that(self, claim, condition, detail=""):
+        if condition:
+            sys.stderr.write("  %s %s\n" % (OUT.ok("ok"), claim))
+        else:
+            sys.stderr.write("  %s %s%s\n"
+                             % (OUT.bad("FAIL"), claim,
+                                ("  [" + detail + "]") if detail else ""))
+            self.failed.append(claim)
+
+
+def fixture(root):
+    git = Git(root)
+    git.run(["init", "--quiet", "--initial-branch=main", "."])
+    hooks = os.path.join(root, "no-hooks")
+    os.mkdir(hooks)
+    git.run(["config", "core.hooksPath", hooks])
+    git.run(["config", "user.name", FIXTURE_AUTHOR[0]])
+    git.run(["config", "user.email", FIXTURE_AUTHOR[1]])
+    git.run(["config", "commit.gpgsign", "false"])
+
+    def write(name, text):
+        with open(os.path.join(root, name), "w") as handle:
+            handle.write(text + "\n")
+
+    def commit(name, text, message):
+        write(name, text)
+        git.run(["add", name])
+        git.run(["commit", "--quiet", "-m", message])
+        return git.text(["rev-parse", "HEAD"])
+
+    first = commit("a", "one", "first")
+    git.run(["checkout", "--quiet", "-b", "side"])
+    side = commit("s", "side", "on the side")
+    git.run(["checkout", "--quiet", "main"])
+    second = commit("b", "two", "second")
+    git.run(["merge", "--quiet", "--no-ff", "-m", "merge side", "side"])
+    merge = git.text(["rev-parse", "HEAD"])
+    third = commit("c", "three", "third")
+    git.run(["branch", "also"])
+    return git, dict(first=first, side=side, second=second,
+                     merge=merge, third=third)
+
+
+def snapshot(git, shas):
+    out = {}
+    for sha in shas:
+        commit = read_commits(git, [sha])[sha]
+        out[sha] = (commit.tree, commit.value("author"),
+                    commit.value("committer"), len(commit.parents))
+    return out
+
+
+def self_test():
+    case = Case()
+    root = tempfile.mkdtemp(prefix="git-reword-selftest-")
+    saved = OUT.level
+    try:
+        git, sha = fixture(root)
+        before = snapshot(git, list(sha.values()))
+        head_before = git.text(["rev-parse", "main"])
+
+        table = render_table(read_commits(git, [sha["second"]]),
+                             [sha["second"]])
+        back = parse_table(table)
+        case.that("the table round-trips a message unchanged",
+                  len(back) == 1 and back[0][1].strip() == "second",
+                  repr(back))
+
+        OUT.level = 0
+        rc = main(["-C", root, "-q", sha["second"], "-m", "reworded second"])
+        OUT.level = saved
+        case.that("the rewrite reports success", rc == E_OK, "rc %d" % rc)
+
+        head_after = git.text(["rev-parse", "main"])
+        case.that("main moved", head_after != head_before)
+        case.that("also moved with it",
+                  git.text(["rev-parse", "also"]) == head_after,
+                  "a ref left behind is the failure this guards")
+        case.that("the backup holds the old tip",
+                  head_before in git.text(
+                      ["for-each-ref", "--format=%(objectname)",
+                       "refs/reword-backup"]).split())
+
+        walked = git.lines(["rev-list", "--topo-order", "main"])
+        after = snapshot(git, walked)
+        trees_before = sorted(v[0] for v in before.values())
+        trees_after = sorted(v[0] for v in after.values())
+        case.that("every tree survives the replay",
+                  trees_before == trees_after,
+                  "%d before, %d after" % (len(trees_before), len(trees_after)))
+        case.that("the merge is still a merge",
+                  sorted(v[3] for v in after.values()) ==
+                  sorted(v[3] for v in before.values()))
+        case.that("authors and committers are carried, not taken fresh",
+                  sorted((v[1], v[2]) for v in after.values()) ==
+                  sorted((v[1], v[2]) for v in before.values()))
+        case.that("the side branch was not touched",
+                  sha["side"] in walked or
+                  git.ok(["cat-file", "-e", sha["side"]]))
+        case.that("the side ref still names its own commit",
+                  git.text(["rev-parse", "side"]) == sha["side"])
+        case.that("the message is the new one",
+                  "reworded second" in git.text(
+                      ["log", "--format=%s", "main"]).split("\n"))
+        case.that("no commit still carries the old message",
+                  "second" not in git.text(
+                      ["log", "--format=%s", "main"]).split("\n"))
+
+        with open(os.path.join(root, "d"), "w") as handle:
+            handle.write("four\n")
+        git.run(["add", "d"])
+        git.run(["-c", "user.name=" + FIXTURE_OTHER[0],
+                 "-c", "user.email=" + FIXTURE_OTHER[1],
+                 "commit", "--quiet", "-m", "theirs"])
+        theirs = git.text(["rev-parse", "HEAD"])
+
+        OUT.level = 0
+        loud = sys.stderr
+        sys.stderr = open(os.devnull, "w")   # the refusal is the result here
+        try:
+            main(["-C", root, "-q", theirs, "-m", "mine now"])
+            refused = 0
+        except SystemExit as stop:
+            refused = stop.code
+        finally:
+            sys.stderr.close()
+            sys.stderr = loud
+        OUT.level = saved
+        case.that("another author's commit is refused",
+                  refused == E_AUTHOR, "exit %r" % (refused,))
+        case.that("and it is left as it was",
+                  git.text(["rev-parse", "HEAD"]) == theirs)
+
+        OUT.level = 0
+        rc = main(["-C", root, "-q", "-n", theirs,
+                   "-m", "mine now", "--any-author"])
+        OUT.level = saved
+        case.that("--dry-run writes nothing",
+                  rc == E_OK and git.text(["rev-parse", "HEAD"]) == theirs)
+
+        # Azure DevOps writes a trailing space on every generated subject, so
+        # a table that trims one reports a commit as edited that nobody
+        # touched, and rewords it for nothing.  Whitespace is message text.
+        git.run(["commit", "--quiet", "--allow-empty", "--cleanup=verbatim",
+                 "-F", "-"],
+                stdin=b"a subject with a trailing space \n\nand a body.\n")
+        fresh = git.lines(["rev-list", "--reverse", "HEAD~1..HEAD"])
+        table = render_table(read_commits(git, fresh), fresh)
+        case.that("a trailing space survives the table",
+                  changed_only(git, parse_table(table)) == [],
+                  "an unedited entry came back as edited")
+    finally:
+        OUT.level = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+    if case.failed:
+        sys.stderr.write(OUT.bad("%d of the checks failed\n"
+                                 % len(case.failed)))
+        return E_FAIL
+    sys.stderr.write(OUT.ok("the replay changes the message and nothing "
+                            "else\n"))
+    return E_OK
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.stderr.write("\n%s: interrupted\n" % PROG)
+        sys.exit(E_FAIL)
