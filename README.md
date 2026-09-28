@@ -50,8 +50,10 @@ it, and prints the `git update-ref` line that puts each one back.
 zero, the message indented four spaces beneath it. Change a message to reword
 that commit; leave it alone, or delete the entry, and that commit is untouched.
 
-    commit 7bf6489a5828  2026-03-14  Philip Dye
-        Fix handsOffDate year, 2026
+    commit 7bf6489a5828  2026-03-14  A Person
+        the subject as it stands
+
+        and its body, indented the same way.
 
 Comparison is exact, trailing whitespace included, so a commit nobody edited is
 never reworded to the same text under a new id.
@@ -64,10 +66,14 @@ which places it at `~/.local/bin/git-reword`, where git finds it as the
 subcommand `git reword`. `./install --verify` reports drift; `./install
 --prefix DIR` puts it elsewhere.
 
+Called that way, ask for `git reword -h`, not `--help`: git turns `--help`
+into a man page lookup for every subcommand, and there is no man page here.
+`git-reword --help` works.
+
 ## Exit codes
 
 0 ran, 1 failed, 2 usage, 3 not a repository or no such revision, 4 a ref is
 checked out in another worktree, 5 another author's commit, 6 already
 published, 7 a tag stands on it.
 
-`git reword --help` has the rest.
+`git reword -h` has the rest.

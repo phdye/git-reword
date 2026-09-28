@@ -113,6 +113,10 @@ Options:
   -h, --help           This usage, then exit
   -V, --version        The version, then exit
 
+Called as 'git reword', use -h rather than --help: git turns --help into a
+man page lookup for every subcommand, and there is no man page here.  Called
+by its own name, both work.
+
 The table:
   An entry is a 'commit' line at column zero with the message indented four
   spaces beneath it.  Edit a message to reword that commit.  Leave one as it
