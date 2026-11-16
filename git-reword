@@ -674,10 +674,22 @@ def build_plan(git, top, wanted, opt):
     return plan
 
 
-def check(git, top, plan, opt):
-    """Everything that should stop the run, found before anything is written."""
+def check(git, top, plan, opt, before_edit=False):
+    """Everything that should stop the run, found before anything is written.
+
+    Run once more before --edit opens the editor, over every commit the
+    table will offer, so that a refusal costs the operator nothing.  None of
+    these checks reads a new message, so the answer before editing is the
+    answer after, unless the repository moved while the editor was open --
+    which is why the run after the editor closes checks again."""
+    after = (["no editing was started; the editor was not opened"]
+             if before_edit else [])
+
+    def refuse(code, message, detail):
+        die(code, message, detail + after)
+
     if not plan.branches and not plan.tags and not plan.detached:
-        die(E_FAIL, "no local ref stands on any of those commits",
+        refuse(E_FAIL, "no local ref stands on any of those commits",
             ["nothing would move, so nothing was written"] +
             ["  " + s[:12] for s in plan.target_order] +
             ["a --refs pattern that matches nothing does this too"
@@ -688,7 +700,7 @@ def check(git, top, plan, opt):
     held = other_worktree_branches(git, top)
     blocked = [(n, held[n]) for n, _ in plan.branches if n in held]
     if blocked:
-        die(E_WORKTREE,
+        refuse(E_WORKTREE,
             "a branch that must move is checked out in another worktree",
             ["%s in %s" % (n, p) for n, p in blocked] +
             ["that worktree's index would describe a commit its branch no",
@@ -696,7 +708,7 @@ def check(git, top, plan, opt):
              "close it, or move it off the branch, then run again"])
 
     if plan.tags and not opt.skip_tags:
-        die(E_TAG, "a tag stands on a commit being reworded",
+        refuse(E_TAG, "a tag stands on a commit being reworded",
             ["%s -> %s" % (n, s[:12]) for n, s, _ in plan.tags] +
             ["a tag is a promise that an id will not move, so this tool does",
              "not move one and will not retag for you",
@@ -711,7 +723,7 @@ def check(git, top, plan, opt):
         if mine and email and email.lower() != mine.lower():
             theirs.append((sha, commit.author_name(), email))
     if theirs and not opt.any_author:
-        die(E_AUTHOR, "a commit being reworded belongs to another author",
+        refuse(E_AUTHOR, "a commit being reworded belongs to another author",
             ["%s  %s <%s>" % (s[:12], n, e) for s, n, e in theirs] +
             ["this repository's identity is <%s>" % (mine or "unset"),
              "rewording puts your name on somebody else's words",
@@ -736,7 +748,7 @@ def check(git, top, plan, opt):
         detail = []
         for sha, holders in published:
             detail.append("%s  on %s" % (sha[:12], ", ".join(holders)))
-        die(E_PUBLISHED, "a commit being reworded is already published",
+        refuse(E_PUBLISHED, "a commit being reworded is already published",
             detail +
             ["the remote holds the old id, so publishing the new one takes a",
              "force push; this tool does not force push and will not help",
@@ -1110,7 +1122,23 @@ def settle_all(opt):
     return opt
 
 
-def gather(git, opt):
+def preflight(git, top, shas, commits, opt):
+    """Every refusal the run could make, over every commit the table offers,
+    before the operator spends any time in the editor.  A refusal found only
+    after the editor closes throws that editing away.
+
+    The whole table is checked, not the entries that will change, since
+    which those are is not known until the editor closes.  A published
+    commit in the table therefore refuses even if it would have been left
+    alone: narrow the selection, or say --published."""
+    OUT.step("checking the %d commit%s before the editor opens"
+             % (len(shas), "" if len(shas) == 1 else "s"))
+    plan = build_plan(git, top, [(sha, None) for sha in shas], opt)
+    plan.commits.update(commits)
+    check(git, top, plan, opt, before_edit=True)
+
+
+def gather(git, top, opt):
     """The commits to reword and what to say about each, whichever way the
     caller chose to say it."""
     if opt.from_file:
@@ -1121,6 +1149,7 @@ def gather(git, opt):
         rng = opt.rev or default_range(git)
         shas = range_commits(git, rng)
         commits = read_commits(git, shas)
+        preflight(git, top, shas, commits, opt)
         path = os.path.join(git.text(["rev-parse", "--absolute-git-dir"]),
                             "REWORD_TODO")
         with open(path, "w") as handle:
@@ -1178,7 +1207,7 @@ def main(argv):
         emit(opt)(render_table(read_commits(git, shas), shas))
         return E_OK
 
-    wanted = gather(git, opt)
+    wanted = gather(git, top, opt)
     if not wanted:
         OUT.note("nothing to reword; no message differs from the one it has")
         return E_OK
@@ -1426,6 +1455,66 @@ def self_test():
         said = stderr_of(["-C", root, "-q", "-o", os.devnull,
                           "HEAD", "-m", "unspoken"])
         case.that("and -q reports nothing", said == "", repr(said))
+
+        # A refusal found only after the editor closes throws away the
+        # operator's editing.  Everything that can refuse without reading
+        # the new messages is checked first, visibly, and the editor never
+        # opens.
+        marker = os.path.join(root, "editor-ran")
+        editor = os.path.join(root, "editor.sh")
+        with open(editor, "w") as handle:
+            handle.write("#!/bin/sh\n: > '%s'\n"
+                         "sed -i 's/^    \\(.*[a-z]\\)$/    \\1, edited/' \"$1\"\n"
+                         % marker)
+        os.chmod(editor, 0o755)
+
+        def edit_run():
+            if os.path.exists(marker):
+                os.remove(marker)
+            old_editor = os.environ.get("GIT_EDITOR")
+            os.environ["GIT_EDITOR"] = editor
+            loud = sys.stderr
+            sys.stderr = io.StringIO()
+            try:
+                code = main(["-C", root, "--color", "never", "-o", os.devnull,
+                             "--any-author", "--edit", "HEAD~2"])
+            except SystemExit as stop:
+                code = stop.code
+            finally:
+                said = sys.stderr.getvalue()
+                sys.stderr = loud
+                OUT.level = saved
+                if old_editor is None:
+                    del os.environ["GIT_EDITOR"]
+                else:
+                    os.environ["GIT_EDITOR"] = old_editor
+            return code, said, os.path.exists(marker)
+
+        git.run(["update-ref", "refs/remotes/origin/main", "HEAD~1"])
+        code, said, edited = edit_run()
+        case.that("--edit over a published commit refuses with its code",
+                  code == E_PUBLISHED, "exit %r" % (code,))
+        case.that("and the editor never opens", not edited)
+        case.that("the published check shows progress before the refusal",
+                  "remote-tracking ref for published commits" in said
+                  and said.index("remote-tracking ref") <
+                  said.index("already published"), repr(said))
+        case.that("and the refusal says no editing was started",
+                  "no editing was started" in said, repr(said))
+        git.run(["update-ref", "-d", "refs/remotes/origin/main"])
+
+        git.run(["tag", "pinned", "HEAD~1"])
+        code, said, edited = edit_run()
+        case.that("--edit under a tag refuses before the editor opens",
+                  code == E_TAG and not edited,
+                  "exit %r, editor %s" % (code, "ran" if edited else "idle"))
+        git.run(["tag", "-d", "pinned"])
+
+        code, said, edited = edit_run()
+        case.that("with nothing in the way --edit still edits and rewords",
+                  code == E_OK and edited and
+                  ", edited" in git.text(["log", "-1", "--format=%s"]),
+                  "exit %r: %r" % (code, said))
     finally:
         OUT.level = saved
         shutil.rmtree(root, ignore_errors=True)

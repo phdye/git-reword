@@ -50,6 +50,15 @@ A tag standing on a commit being reworded. A tag is a promise that an id will
 not move. `--skip-tags` leaves it where it is, which keeps the pre-rewrite
 commits reachable.
 
+`--edit` runs all of these before the editor opens, over every commit the
+table offers, through the same `check()` with `before_edit`. A refusal found
+after the editor closes throws the operator's editing away, which happened on
+a real run. None of the checks reads a new message, so the answer cannot
+change with the editing; `check()` still runs again afterwards on the commits
+actually changed, in case the repository moved meanwhile. The whole table is
+checked, not the entries that will change, because those are unknown until
+the editor closes.
+
 ## Moving one ref is the bug worth guarding
 
 Reword a commit that `main` and `develop` both carry, move only `main`, and the

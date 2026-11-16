@@ -69,6 +69,13 @@ commas, in any order, it offers those and nothing between them, oldest first,
 which is the way to reword four commits scattered through fifty. All of them
 are reworded in one replay.
 
+Before the editor opens, `--edit` checks every commit in the table against
+everything that would refuse the run (published, under a tag, in another
+worktree's branch, another author), with the same progress counts, so a
+refusal comes before any editing rather than after it. A published commit in
+the table refuses even if you meant to leave it alone; narrow the selection,
+or pass `--published`.
+
 ## Install
 
     ./install
