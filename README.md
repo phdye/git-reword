@@ -78,17 +78,20 @@ or pass `--published`.
 
 ## Published commits
 
-A commit a remote-tracking branch holds needs `--published`, and even then only
-when every branch holding it can take a force push. Declare those per
-repository, then fetch so the remote-tracking refs are current:
+A commit a remote-tracking branch holds needs `--published`, and even then
+only when every branch holding it can take your force push. That is a
+permission on the server, so the server is asked: for each holding branch,
+Azure DevOps evaluates whether you hold Force push and Contribute there, and
+whether a blocking branch policy applies that you may not bypass.
 
-    git config --add reword.forcePushable 'origin/integration/*'
-    git config --add reword.forcePushable 'origin/fix/*'
+    export AZURE_DEVOPS_PAT=...     # read from the environment, never printed
     git fetch --prune
     git reword --published --edit a1b2c3d,e4f5a6b
 
-A commit on any branch not declared, `origin/main` or `origin/develop` say, is
-refused with exit 8 before the editor opens, and no option gets past that.
+`AZURE_DEVOPS_ORG`, `AZURE_DEVOPS_PROJECT` and `AZURE_DEVOPS_REPO`, where set,
+must agree with the remote's URL. A branch the server says no to, or whose
+answer cannot be had (a remote not on Azure DevOps, no token, a failed call),
+is refused with exit 8 before the editor opens, and no option gets past that.
 Nothing is pushed; the force push afterwards is yours.
 
 ## Install

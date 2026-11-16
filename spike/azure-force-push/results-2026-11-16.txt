@@ -1,0 +1,48 @@
+script     azure-force-push 1.0
+measured   2026-11-16.17-06
+host       CYGWIN_NT-10.0-26200 3.0.7-338.x86_64
+python     3.6.9
+target     Spirits-of-Change/api-sandbox/scratch
+
+repository lookup: http 200
+namespace lookup: http 200
+  bit ForcePush          8
+  bit GenericContribute  4
+  bit PolicyExempt       128
+refs lookup: http 200
+
+fetch for the ground truth: rc 0
+
+branch main
+  evaluation http 200, policies http 200
+  ForcePush=True GenericContribute=True PolicyExempt=False
+  blocking policies: none
+  verdict: force push allowed
+
+branch reword-spike/deny
+  evaluation http 200, policies http 200
+  ForcePush=False GenericContribute=True PolicyExempt=False
+  blocking policies: none
+  verdict: force push refused
+  server: force push refused (TF401027)
+  verdict and server agree
+
+branch reword-spike/open
+  evaluation http 200, policies http 200
+  ForcePush=True GenericContribute=True PolicyExempt=False
+  blocking policies: none
+  verdict: force push allowed
+  server: force push accepted
+  verdict and server agree
+
+branch reword-spike/policy
+  evaluation http 200, policies http 200
+  ForcePush=True GenericContribute=True PolicyExempt=False
+  blocking policies: Minimum number of reviewers
+  verdict: force push refused
+  server: force push refused (TF402455)
+  verdict and server agree
+
+FINDINGS
+  verdicts held against the server: 3 agree, 0 disagree
+  answer: the evaluation batch and the policy scope predict the push

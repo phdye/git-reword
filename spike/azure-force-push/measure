@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+#
+# measure - can Azure DevOps say, before anything is pushed, whether the
+#           caller may force push a given branch?
+#
+# git-reword must refuse a published commit held by a branch that cannot take
+# a force push, and that is a property of the server's permissions, not of
+# anything local.  The question is which calls answer it:
+#
+#   - the permission evaluation batch, for ForcePush on the branch's token in
+#     the Git Repositories namespace, evaluated for the caller's own identity;
+#   - the policy configurations scoped to the branch, since a blocking policy
+#     refuses a direct push unless the caller holds PolicyExempt.
+#
+# Each verdict is then held against the server itself: for every branch under
+# reword-spike/ (spike/azure-force-push/setup makes them) a commit with the
+# tip's tree and parents and a new message -- what a reword makes -- is force
+# pushed, and whether the server took it is compared with the verdict.  main
+# is evaluated and never pushed.
+#
+# The permission bits are read from the namespace by name, not hard-coded.
+#
+# Regenerate (the token is read from the environment and never printed):
+#   AZURE_DEVOPS_PAT=... AZURE_DEVOPS_ORG=... AZURE_DEVOPS_PROJECT=... \
+#   AZURE_DEVOPS_REPO=... spike/azure-force-push/measure \
+#     > spike/azure-force-push/results-$(date +%Y-%m-%d).txt 2>&1
+
+import base64
+import json
+import os
+import platform
+import shutil
+import subprocess
+import tempfile
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+GIT_NAMESPACE = "2e9eb7ed-3c0a-47d4-87c1-0ffdd275fd87"
+
+need = ["AZURE_DEVOPS_PAT", "AZURE_DEVOPS_ORG", "AZURE_DEVOPS_PROJECT",
+        "AZURE_DEVOPS_REPO"]
+missing = [v for v in need if not os.environ.get(v)]
+if missing:
+    sys.exit("measure: unset: " + ", ".join(missing))
+PAT, ORG, PROJECT, REPO = (os.environ[v] for v in need)
+BASE = "https://dev.azure.com/" + urllib.parse.quote(ORG)
+AUTH = "Basic " + base64.b64encode((":" + PAT).encode()).decode()
+
+
+def call(method, url, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": AUTH, "Accept": "application/json",
+        "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.status, json.loads(resp.read().decode() or "null")
+    except urllib.error.HTTPError as err:
+        return err.code, None
+
+
+def token_for(project_id, repo_id, branch):
+    segs = ["".join("%02x" % b for b in seg.encode("utf-16-le"))
+            for seg in branch.split("/")]
+    return "repoV2/%s/%s/refs/heads/%s/" % (project_id, repo_id, "/".join(segs))
+
+
+print("script     azure-force-push 1.0")
+print("measured   %s" % time.strftime("%Y-%m-%d.%H-%M"))
+print("host       %s %s" % (platform.system(), platform.release()))
+print("python     %s" % platform.python_version())
+print("target     %s/%s/%s" % (ORG, PROJECT, REPO))
+print("")
+
+status, repo = call("GET", "%s/%s/_apis/git/repositories/%s?api-version=7.1"
+                    % (BASE, urllib.parse.quote(PROJECT),
+                       urllib.parse.quote(REPO)))
+print("repository lookup: http %s" % status)
+if status != 200:
+    sys.exit(1)
+repo_id, project_id = repo["id"], repo["project"]["id"]
+
+status, ns = call("GET", "%s/_apis/securitynamespaces/%s?api-version=7.1"
+                  % (BASE, GIT_NAMESPACE))
+print("namespace lookup: http %s" % status)
+ns = ns.get("value", ns) if isinstance(ns, dict) else ns
+bits = dict((a["name"], a["bit"]) for a in ns[0]["actions"]) if ns else {}
+for name in ("ForcePush", "GenericContribute", "PolicyExempt"):
+    print("  bit %-18s %s" % (name, bits.get(name)))
+
+status, refs = call("GET", "%s/%s/_apis/git/repositories/%s/refs?filter=heads/"
+                    "&api-version=7.1" % (BASE, project_id, repo_id))
+print("refs lookup: http %s" % status)
+branches = [r["name"][len("refs/heads/"):] for r in (refs or {}).get("value", [])]
+print("")
+
+work = tempfile.mkdtemp(prefix="azure-force-push-")
+askpass = os.path.join(work, "askpass")
+with open(askpass, "w") as handle:
+    handle.write('#!/bin/sh\necho "$AZURE_DEVOPS_PAT"\n')
+os.chmod(askpass, 0o700)
+genv = dict(os.environ, GIT_ASKPASS=askpass, GIT_TERMINAL_PROMPT="0")
+remote = repo["remoteUrl"]
+clone = os.path.join(work, "r")
+
+
+def git(*args):
+    proc = subprocess.run(["git"] + list(args), cwd=clone, env=genv,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return (proc.returncode, proc.stdout.decode().strip(),
+            proc.stderr.decode().strip())
+
+
+os.mkdir(clone)
+git("init", "--quiet", "--bare")
+git("config", "credential.username", "pat")
+rc, _, err = git("fetch", "--quiet", remote, "+refs/heads/*:refs/heads/*")
+print("fetch for the ground truth: rc %d" % rc)
+print("")
+agree = disagree = 0
+
+for branch in branches:
+    token = token_for(project_id, repo_id, branch)
+    evals = [{"securityNamespaceId": GIT_NAMESPACE, "token": token,
+              "permissions": bits[name]}
+             for name in ("ForcePush", "GenericContribute", "PolicyExempt")]
+    status, out = call("POST", "%s/_apis/security/permissionevaluationbatch"
+                       "?api-version=7.1-preview.1" % BASE,
+                       {"alwaysAllowAdministrators": False,
+                        "evaluations": evals})
+    values = [e.get("value") for e in out["evaluations"]] if out else None
+    pstatus, pol = call("GET", "%s/%s/_apis/git/policy/configurations?"
+                        "repositoryId=%s&refName=%s&api-version=7.1-preview.1"
+                        % (BASE, project_id, repo_id,
+                           urllib.parse.quote("refs/heads/" + branch)))
+    blocking = [p["type"]["displayName"] for p in (pol or {}).get("value", [])
+                if p.get("isEnabled") and p.get("isBlocking")]
+    print("branch %s" % branch)
+    print("  evaluation http %s, policies http %s" % (status, pstatus))
+    if values:
+        print("  ForcePush=%s GenericContribute=%s PolicyExempt=%s"
+              % tuple(values))
+    print("  blocking policies: %s" % (", ".join(blocking) or "none"))
+    if values:
+        force, contribute, exempt = values
+        can = force and contribute and (exempt or not blocking)
+        print("  verdict: %s" % ("force push allowed" if can
+                                 else "force push refused"))
+        if branch.startswith("reword-spike/"):
+            _, tree, _ = git("rev-parse", branch + "^{tree}")
+            _, parent, _ = git("rev-parse", branch + "^")
+            _, new, _ = git("commit-tree", tree, "-p", parent, "-m",
+                            "reworded by the measurement")
+            rc, _, err = git("push", "--force", "--quiet", remote,
+                             "%s:refs/heads/%s" % (new, branch))
+            took = rc == 0
+            reason = ""
+            for line in err.splitlines():
+                if "TF" in line or "rejected" in line:
+                    reason = line.split("TF", 1)[-1][:6]
+                    reason = ("TF" + reason) if "TF" in line else "rejected"
+                    break
+            print("  server: force push %s%s" % (
+                "accepted" if took else "refused",
+                "" if took else " (%s)" % (reason or "rc %d" % rc)))
+            if took == bool(can):
+                agree += 1
+                print("  verdict and server agree")
+            else:
+                disagree += 1
+                print("  verdict and server DISAGREE")
+    print("")
+
+shutil.rmtree(work, ignore_errors=True)
+print("FINDINGS")
+print("  verdicts held against the server: %d agree, %d disagree"
+      % (agree, disagree))
+print("  answer: %s" % ("the evaluation batch and the policy scope predict "
+                        "the push" if agree and not disagree else
+                        "not settled"))

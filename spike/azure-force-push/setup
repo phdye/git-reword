@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+#
+# setup - give the sandbox repository the branches measure needs to show a
+#         refusal as well as an allowance.  Idempotent.
+#
+#   reword-spike/deny     ForcePush denied to the caller by an explicit ACE
+#   reword-spike/policy   a blocking minimum-reviewers policy, nothing denied
+#   reword-spike/open     neither, the control that must be allowed
+#
+# Both start at main's tip.  Run it only against a sandbox: it writes refs, a
+# branch policy and an access control entry.  The token is read from the
+# environment and never printed.
+
+import base64
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+GIT_NAMESPACE = "2e9eb7ed-3c0a-47d4-87c1-0ffdd275fd87"
+MIN_REVIEWERS = "fa4e907d-c16b-4a4c-9dfa-4906e5d171dd"
+ZERO = "0" * 40
+
+need = ["AZURE_DEVOPS_PAT", "AZURE_DEVOPS_ORG", "AZURE_DEVOPS_PROJECT",
+        "AZURE_DEVOPS_REPO"]
+missing = [v for v in need if not os.environ.get(v)]
+if missing:
+    sys.exit("setup: unset: " + ", ".join(missing))
+PAT, ORG, PROJECT, REPO = (os.environ[v] for v in need)
+BASE = "https://dev.azure.com/" + urllib.parse.quote(ORG)
+AUTH = "Basic " + base64.b64encode((":" + PAT).encode()).decode()
+
+
+def call(method, url, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": AUTH, "Accept": "application/json",
+        "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.status, json.loads(resp.read().decode() or "null")
+    except urllib.error.HTTPError as err:
+        return err.code, err.read().decode()[:400]
+
+
+def token_for(project_id, repo_id, branch):
+    segs = ["".join("%02x" % b for b in seg.encode("utf-16-le"))
+            for seg in branch.split("/")]
+    return "repoV2/%s/%s/refs/heads/%s/" % (project_id, repo_id, "/".join(segs))
+
+
+status, repo = call("GET", "%s/%s/_apis/git/repositories/%s?api-version=7.1"
+                    % (BASE, urllib.parse.quote(PROJECT),
+                       urllib.parse.quote(REPO)))
+if status != 200:
+    sys.exit("setup: repository lookup http %s" % status)
+repo_id, project_id = repo["id"], repo["project"]["id"]
+git_api = "%s/%s/_apis/git/repositories/%s" % (BASE, project_id, repo_id)
+
+status, refs = call("GET", git_api + "/refs?filter=heads/&api-version=7.1")
+heads = dict((r["name"], r["objectId"]) for r in refs["value"])
+tip = heads["refs/heads/main"]
+
+for branch in ("reword-spike/deny", "reword-spike/policy",
+               "reword-spike/open"):
+    name = "refs/heads/" + branch
+    if name in heads:
+        print("branch %s: present" % branch)
+        continue
+    status, out = call("POST", git_api + "/refs?api-version=7.1",
+                       [{"name": name, "oldObjectId": ZERO,
+                         "newObjectId": tip}])
+    print("branch %s: created, http %s" % (branch, status))
+
+status, conn = call("GET", BASE + "/_apis/connectionData")
+me = conn["authenticatedUser"]["descriptor"]
+token = token_for(project_id, repo_id, "reword-spike/deny")
+status, out = call("POST", "%s/_apis/accesscontrolentries/%s?api-version=7.1"
+                   % (BASE, GIT_NAMESPACE),
+                   {"token": token, "merge": True,
+                    "accessControlEntries": [{"descriptor": me, "allow": 0,
+                                              "deny": 8}]})
+print("deny ForcePush on reword-spike/deny: http %s" % status)
+
+scope = {"repositoryId": repo_id, "refName": "refs/heads/reword-spike/policy",
+         "matchKind": "exact"}
+status, pol = call("GET", "%s/%s/_apis/git/policy/configurations?repositoryId=%s"
+                   "&refName=%s&api-version=7.1-preview.1"
+                   % (BASE, project_id, repo_id,
+                      urllib.parse.quote(scope["refName"])))
+have = [p for p in (pol or {}).get("value", [])
+        if p["type"]["id"] == MIN_REVIEWERS]
+if have:
+    print("policy on reword-spike/policy: present")
+else:
+    status, out = call("POST", "%s/%s/_apis/policy/configurations?api-version=7.1"
+                       % (BASE, project_id),
+                       {"isEnabled": True, "isBlocking": True,
+                        "type": {"id": MIN_REVIEWERS},
+                        "settings": {"minimumApproverCount": 1,
+                                     "creatorVoteCounts": False,
+                                     "scope": [scope]}})
+    print("policy on reword-spike/policy: created, http %s" % status)

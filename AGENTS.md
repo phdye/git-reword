@@ -10,6 +10,7 @@ same committer, same committer date, same number of parents.
     git-reword       the tool
     install          place it on PATH, and say what it replaced
     test/run         the checks, which are the tool's own --self-test
+    test/azure-live  the force push check against a real Azure DevOps sandbox
     spike/           the measurements the design rests on
 
 ## The one decision everything follows from
@@ -42,13 +43,19 @@ A commit a remote-tracking branch already holds. Publishing that rewrite takes
 a force push, and that is the operator's decision, not a tool's. `--published`
 rewrites locally and still pushes nothing; nothing in here pushes anything.
 
-A commit held by a remote-tracking branch that cannot take a force push. This
-one has no flag, `--published` included: the rewrite could never be
-published, so the local history would part from the remote's for good. The
-tool cannot read a remote's permissions, so a branch counts as force-pushable
-only when declared (`git config reword.forcePushable`, `--force-pushable`,
-`GIT_REWORD_FORCE_PUSHABLE`), and anything undeclared is protected. Exit 8.
-Symbolic remote refs such as `origin/HEAD` are not holders in their own right.
+A commit held by a remote-tracking branch that cannot take your force push.
+This one has no flag, `--published` included: the rewrite could never be
+published, so the local history would part from the remote's for good.
+Whether a branch can is a permission on the server, so the server is asked:
+Azure DevOps' permission evaluation for ForcePush and GenericContribute on
+the branch's security token, and the branch's enabled blocking policies
+unless PolicyExempt is held. `spike/azure-force-push` measured those answers
+against real force pushes and they agreed on every branch. Every way of not
+getting the answer (a remote that is not Azure DevOps, no
+`AZURE_DEVOPS_PAT`, an `AZURE_DEVOPS_*` value the URL disagrees with, a
+failed call) is a no. Exit 8. Symbolic remote refs such as `origin/HEAD` are
+not holders in their own right. `test/azure-live` runs the check against a
+sandbox; `--self-test` covers every refusal that needs no server.
 
 A branch another worktree has checked out. Moving the ref leaves that
 worktree's index describing a commit its branch no longer names, and git then

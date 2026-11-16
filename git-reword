@@ -30,12 +30,14 @@
 # that is the operator's call rather than a tool's.  Each has a flag, and
 # neither flag pushes anything.  A commit held by a branch that cannot take a
 # force push at all has no flag: rewording it would part the local history
-# from the remote's for good.
+# from the remote's for good.  Whether a branch can is the server's to say,
+# so the server is asked.
 #
 # Every ref it moves is copied under refs/reword-backup/<stamp>/ before the
 # move, and the command that puts each one back is printed.
 
 import argparse
+import base64
 import io
 import json
 import os
@@ -94,16 +96,10 @@ Options:
   -r, --refs PATTERN   Move only refs matching PATTERN; repeatable
       --any-author     Reword commits this identity did not write
       --no-any-author
-      --published      Reword commits a remote-tracking branch already holds.
-                       Publishing them afterwards takes a force push, which
-                       this tool does not do and will not help with.
+      --published      Reword commits a remote-tracking branch already holds,
+                       when the server says every such branch can take your
+                       force push.  This tool does not push.
       --no-published
-      --force-pushable PATTERN
-                       A remote-tracking branch that can take a force push,
-                       as remote/branch; a glob; repeatable.  Replaces
-                       git config reword.forcePushable, which is where the
-                       list normally lives.  A published commit is reworded
-                       only when every branch holding it matches.
       --skip-tags      Leave a tag standing on the old history rather than
                        refusing to run
       --no-skip-tags
@@ -141,9 +137,13 @@ Environment:
   GIT_REWORD_REFS, GIT_REWORD_ANY_AUTHOR, GIT_REWORD_PUBLISHED,
   GIT_REWORD_SKIP_TAGS, GIT_REWORD_DIRECTORY, GIT_REWORD_DRY_RUN,
   GIT_REWORD_COLOR, GIT_REWORD_VERBOSE, GIT_REWORD_TERSE, GIT_REWORD_QUIET,
-  GIT_REWORD_DEBUG, GIT_REWORD_FORCE_PUSHABLE (comma separated).  An option beats its variable, a variable beats the
+  GIT_REWORD_DEBUG.  An option beats its variable, a variable beats the
   default.  GIT_EDITOR, VISUAL and EDITOR select the editor for --edit, in
   that order.
+
+  AZURE_DEVOPS_PAT     The token the permission check asks Azure DevOps with
+  AZURE_DEVOPS_ORG, AZURE_DEVOPS_PROJECT, AZURE_DEVOPS_REPO
+                       Where set, each must agree with the remote's own URL
 
 Exit codes:
   0  the rewrite ran, or --dry-run printed a plan
@@ -154,18 +154,20 @@ Exit codes:
   5  a commit belongs to another author
   6  a commit is already published
   7  a tag stands on a commit being reworded
-  8  a commit is held by a branch not declared force-pushable
+  8  a commit is held by a branch that cannot take your force push, or
+     whose permissions could not be read
 
 Branches that cannot take a force push:
-  A commit any remote-tracking branch holds is refused unless every branch
-  holding it is declared force-pushable, and no option gets past that: once
-  rewritten, such a commit could never be published, and the local history
-  would part from the remote's for good.  What is not declared is taken as
-  protected, since the remote's permissions cannot be read from here.
-  Declare them per repository:
-    git config --add reword.forcePushable 'origin/integration/*'
-  The check reads the remote-tracking refs as of the last fetch, so fetch
-  first.  With --edit it runs before the editor opens.
+  A commit any remote-tracking branch holds is refused when that branch
+  cannot take your force push, and no option gets past that: rewritten, such
+  a commit could never be published, and the local history would part from
+  the remote's for good.  Whether it can is the server's to say, so Azure
+  DevOps is asked, for each holding branch, whether you hold Force push and
+  Contribute there and, where a blocking branch policy applies, the
+  permission to bypass it.  A branch whose answer cannot be had -- a remote
+  that is not Azure DevOps, no token, a failed call -- counts as one that
+  cannot.  The remote-tracking refs are read as of the last fetch, so fetch
+  first.  With --edit the check runs before the editor opens.
 """
 
 
@@ -774,26 +776,26 @@ def check(git, top, plan, opt, before_edit=False):
         if holders:
             published.append((sha, holders))
     progress.done()
-    patterns = force_pushable(git, opt)
+    holders = sorted(set(h for _, hs in published for h in hs))
+    verdicts = force_push_verdicts(git, holders) if holders else {}
     locked = []
-    for sha, holders in published:
-        fixed = [h for h in holders if not pushable(h, patterns)]
+    for sha, hs in published:
+        fixed = [h for h in hs if not verdicts[h][0]]
         if fixed:
             locked.append((sha, fixed))
     if locked:
         # Not an option's to waive.  A rewrite of a commit such a branch
         # holds can never be published, so the local history would part
         # from the remote's for good.
+        named = sorted(set(h for _, fixed in locked for h in fixed))
         refuse(E_PROTECTED,
-               "a commit being reworded is on a branch that cannot be "
-               "force pushed",
+               "a commit being reworded is on a branch that cannot take "
+               "your force push",
                ["%s  on %s" % (sha[:12], ", ".join(short_remote(r)
                                                    for r in fixed))
                 for sha, fixed in locked] +
-               ["no option gets past this; leave these commits out",
-                "a branch counts as force-pushable only when declared:",
-                "  git config --add reword.forcePushable 'REMOTE/BRANCH'",
-                "declared now: " + (", ".join(patterns) or "nothing")])
+               ["%s: %s" % (short_remote(r), verdicts[r][1]) for r in named] +
+               ["no option gets past this; leave these commits out"])
 
     if published and not opt.published:
         detail = []
@@ -803,20 +805,11 @@ def check(git, top, plan, opt, before_edit=False):
             detail +
             ["the remote holds the old id, so publishing the new one takes a",
              "force push; this tool does not force push and will not help",
-             "every branch holding them is declared force-pushable, so",
-             "--published rewrites locally, and still pushes nothing"])
+             "Azure DevOps says every branch holding them can take your",
+             "force push, so --published rewrites locally; it pushes nothing"])
     if published and opt.published:
         OUT.warn("rewriting published commits; the remote keeps the old ids "
                  "until you force push, which is yours to decide")
-
-
-def force_pushable(git, opt):
-    """The remote-tracking branches declared able to take a force push:
-    the option, else its variable, else git config reword.forcePushable."""
-    if opt.force_pushable is not None:
-        return opt.force_pushable
-    return git.lines(["config", "--get-all", "reword.forcePushable"],
-                     check=False)
 
 
 def short_remote(ref):
@@ -824,10 +817,174 @@ def short_remote(ref):
     return ref[len(prefix):] if ref.startswith(prefix) else ref
 
 
-def pushable(ref, patterns):
-    import fnmatch
-    name = short_remote(ref)
-    return any(fnmatch.fnmatchcase(name, p) for p in patterns)
+# --------------------------------------------------------- force push check
+#
+# Whether a branch can take a force push is a permission on the server, and
+# only the server can answer it.  spike/azure-force-push measured the answer
+# against real pushes: Force push and Contribute evaluated for the caller on
+# the branch's security token, and any enabled blocking policy scoped to the
+# branch unless the caller may bypass it.  Every way of failing to get that
+# answer is a "no", so the check can only ever err toward refusing.
+
+AZURE_GIT_NAMESPACE = "2e9eb7ed-3c0a-47d4-87c1-0ffdd275fd87"
+AZURE_URLS = [
+    re.compile(r"^https?://(?:[^@/]+@)?dev\.azure\.com/([^/]+)/([^/]+)"
+               r"/_git/([^/?#]+?)/?$"),
+    re.compile(r"^https?://(?:[^@/]+@)?([^./@]+)\.visualstudio\.com/"
+               r"(?:DefaultCollection/)?([^/]+)/_git/([^/?#]+?)/?$"),
+    re.compile(r"^(?:ssh://)?[^@/]+@(?:ssh\.dev\.azure\.com|"
+               r"vs-ssh\.visualstudio\.com)[:/]v3/([^/]+)/([^/]+)"
+               r"/([^/]+?)(?:\.git)?/?$"),
+]
+
+
+def azure_target(url):
+    """(organization, project, repository) for an Azure DevOps URL, or None."""
+    from urllib.parse import unquote
+    for pattern in AZURE_URLS:
+        match = pattern.match(url.strip())
+        if match:
+            return tuple(unquote(g) for g in match.groups())
+    return None
+
+
+def azure_branch_token(project_id, repo_id, branch):
+    """The branch's token in the Git Repositories security namespace: each
+    path segment of the name as UTF-16LE hex."""
+    segments = ["".join("%02x" % b for b in seg.encode("utf-16-le"))
+                for seg in branch.split("/")]
+    return "repoV2/%s/%s/refs/heads/%s/" % (project_id, repo_id,
+                                             "/".join(segments))
+
+
+class AzureError(Exception):
+    pass
+
+
+class Azure(object):
+    """One repository on Azure DevOps, asked about as few times as will do."""
+
+    def __init__(self, org, project, repo, token):
+        from urllib.parse import quote
+        self.base = "https://dev.azure.com/" + quote(org, safe="")
+        self.auth = "Basic " + base64.b64encode(
+            (":" + token).encode("utf-8")).decode("ascii")
+        _, found = self.call(
+            "GET", "%s/%s/_apis/git/repositories/%s?api-version=7.1"
+            % (self.base, quote(project, safe=""), quote(repo, safe="")))
+        self.repo_id = found["id"]
+        self.project_id = found["project"]["id"]
+        _, spaces = self.call(
+            "GET", "%s/_apis/securitynamespaces/%s?api-version=7.1"
+            % (self.base, AZURE_GIT_NAMESPACE))
+        if isinstance(spaces, dict):
+            spaces = spaces.get("value")
+        self.bits = dict((a["name"], a["bit"]) for a in spaces[0]["actions"])
+
+    def call(self, method, url, body=None):
+        import urllib.error
+        import urllib.request
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        request = urllib.request.Request(
+            url, data=data, method=method,
+            headers={"Authorization": self.auth,
+                     "Accept": "application/json",
+                     "Content-Type": "application/json"})
+        what = url.split("/_apis/", 1)[-1].split("?", 1)[0]
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.status, json.loads(
+                    response.read().decode("utf-8") or "null")
+        except urllib.error.HTTPError as error:
+            raise AzureError("Azure DevOps answered http %d to %s"
+                             % (error.code, what))
+        except (urllib.error.URLError, OSError, ValueError) as error:
+            raise AzureError("Azure DevOps could not be asked about %s: %s"
+                             % (what, error))
+
+    def verdict(self, branch):
+        """(may force push, why not)."""
+        from urllib.parse import quote
+        names = ("ForcePush", "GenericContribute", "PolicyExempt")
+        token = azure_branch_token(self.project_id, self.repo_id, branch)
+        _, out = self.call(
+            "POST", "%s/_apis/security/permissionevaluationbatch"
+            "?api-version=7.1-preview.1" % self.base,
+            {"alwaysAllowAdministrators": False,
+             "evaluations": [{"securityNamespaceId": AZURE_GIT_NAMESPACE,
+                              "token": token, "permissions": self.bits[n]}
+                             for n in names]})
+        force, contribute, exempt = [bool(e.get("value"))
+                                     for e in out["evaluations"]]
+        _, policies = self.call(
+            "GET", "%s/%s/_apis/git/policy/configurations?repositoryId=%s"
+            "&refName=%s&api-version=7.1-preview.1"
+            % (self.base, self.project_id, self.repo_id,
+               quote("refs/heads/" + branch, safe="")))
+        blocking = [p["type"]["displayName"]
+                    for p in (policies or {}).get("value", [])
+                    if p.get("isEnabled") and p.get("isBlocking")]
+        if not force:
+            return False, "Azure DevOps denies you Force push there"
+        if not contribute:
+            return False, "Azure DevOps denies you Contribute there"
+        if blocking and not exempt:
+            return False, ("a blocking branch policy applies (%s) and you "
+                           "may not bypass it" % ", ".join(blocking))
+        return True, ""
+
+
+def force_push_verdicts(git, holders):
+    """{remote-tracking ref: (may force push, why not)} for each holder."""
+    names = sorted(git.lines(["remote"]), key=len, reverse=True)
+    token = os.environ.get("AZURE_DEVOPS_PAT", "")
+    servers = {}
+    out = {}
+    progress = Progress("asking whether %d branch%s can take your force push"
+                        % (len(holders), "" if len(holders) == 1 else "es"),
+                        len(holders))
+    for ref in holders:
+        progress.tick()
+        short = short_remote(ref)
+        remote = next((n for n in names if short.startswith(n + "/")), None)
+        if remote is None:
+            out[ref] = (False, "no configured remote names it, so its "
+                               "server cannot be asked")
+            continue
+        branch = short[len(remote) + 1:]
+        url = git.text(["remote", "get-url", remote], check=False)
+        target = azure_target(url)
+        if target is None:
+            out[ref] = (False, "remote %s is not on Azure DevOps, so whether "
+                               "it can take a force push cannot be read"
+                        % remote)
+            continue
+        wrong = [(var, os.environ[var], have) for var, have in
+                 zip(("AZURE_DEVOPS_ORG", "AZURE_DEVOPS_PROJECT",
+                      "AZURE_DEVOPS_REPO"), target)
+                 if os.environ.get(var) and
+                 os.environ[var].lower() != have.lower()]
+        if wrong:
+            out[ref] = (False, "; ".join("%s is %s but remote %s says %s"
+                                         % (v, e, remote, h)
+                                         for v, e, h in wrong))
+            continue
+        if not token:
+            out[ref] = (False, "AZURE_DEVOPS_PAT is not set, so Azure DevOps "
+                               "cannot be asked")
+            continue
+        try:
+            if target not in servers:
+                servers[target] = Azure(target[0], target[1], target[2],
+                                        token)
+            out[ref] = servers[target].verdict(branch)
+        except AzureError as error:
+            out[ref] = (False, str(error))
+        except (KeyError, IndexError, TypeError) as error:
+            out[ref] = (False, "Azure DevOps answered in a shape this tool "
+                               "does not read (%s)" % error)
+    progress.done()
+    return out
 
 
 def walk(git, plan):
@@ -1121,8 +1278,6 @@ def build_parser():
                         action="store_true", default=None)
     parser.add_argument("--no-published", dest="published",
                         action="store_false")
-    parser.add_argument("--force-pushable", dest="force_pushable",
-                        action="append", default=None)
     parser.add_argument("--skip-tags", dest="skip_tags",
                         action="store_true", default=None)
     parser.add_argument("--no-skip-tags", dest="skip_tags",
@@ -1189,13 +1344,6 @@ def settle_all(opt):
     if opt.refs is None:
         from_env = env_str("REFS")
         opt.refs = [p for p in from_env.split(",") if p] if from_env else []
-    if opt.force_pushable is None:
-        # None, not empty, means neither was given and the repository's
-        # git config decides; check() reads it once the repository is open.
-        from_env = env_str("FORCE_PUSHABLE")
-        if from_env is not None:
-            opt.force_pushable = [p.strip() for p in from_env.split(",")
-                                  if p.strip()]
     if opt.directory is None:
         opt.directory = env_str("DIRECTORY")
     if opt.output is None:
@@ -1572,47 +1720,73 @@ def self_test():
                     os.environ["GIT_EDITOR"] = old_editor
             return code, said, os.path.exists(marker)
 
-        git.run(["update-ref", "refs/remotes/origin/main", "HEAD~1"])
-        git.run(["config", "reword.forcePushable", "origin/*"])
-        code, said, edited = edit_run()
-        case.that("--edit over a published commit refuses with its code",
-                  code == E_PUBLISHED, "exit %r" % (code,))
-        case.that("and the editor never opens", not edited)
-        case.that("the published check shows progress before the refusal",
-                  "remote-tracking ref for published commits" in said
-                  and said.index("remote-tracking ref") <
-                  said.index("already published"), repr(said))
-        case.that("and the refusal says no editing was started",
-                  "no editing was started" in said, repr(said))
-
-        # A branch that cannot take a force push is a hard stop: no option
-        # gets past it, and it is found before the editor opens.  What is
-        # not declared force-pushable is taken to be protected.
-        git.run(["update-ref", "refs/remotes/origin/develop", "HEAD~1"])
-        git.run(["config", "reword.forcePushable", "origin/main"])
-        code, said, edited = edit_run("--published")
-        case.that("a commit on a protected branch refuses even with "
-                  "--published", code == E_PROTECTED, "exit %r" % (code,))
-        case.that("and names the branch, before the editor opens",
-                  "origin/develop" in said and not edited, repr(said))
-        git.run(["update-ref", "-d", "refs/remotes/origin/develop"])
-
-        git.run(["config", "--unset-all", "reword.forcePushable"])
-        code, said, edited = edit_run("--published")
-        case.that("with nothing declared, every branch counts as protected",
-                  code == E_PROTECTED and not edited, "exit %r" % (code,))
-
-        os.environ[ENV + "FORCE_PUSHABLE"] = "nowhere/*"
+        # A published commit whose branch cannot be shown able to take a
+        # force push is a hard stop: no option gets past it, and it is found
+        # before the editor opens.  None of these reach the network: each
+        # fails before a call is made, which is the point -- every way of
+        # not getting the server's answer is a refusal.
+        saved_env = dict((v, os.environ.pop(v)) for v in
+                         ("AZURE_DEVOPS_PAT", "AZURE_DEVOPS_ORG",
+                          "AZURE_DEVOPS_PROJECT", "AZURE_DEVOPS_REPO")
+                         if v in os.environ)
         try:
-            code, said, edited = edit_run("--published",
-                                          "--force-pushable", "origin/m*")
+            git.run(["update-ref", "refs/remotes/origin/main", "HEAD~1"])
+            code, said, edited = edit_run("--published")
+            case.that("a published commit no server vouches for refuses, "
+                      "--published or not", code == E_PROTECTED,
+                      "exit %r" % (code,))
+            case.that("and the editor never opens", not edited)
+            case.that("the published check shows progress before the "
+                      "refusal",
+                      "remote-tracking ref for published commits" in said
+                      and said.index("remote-tracking ref") <
+                      said.index("cannot take your force push"), repr(said))
+            case.that("and the refusal says no editing was started",
+                      "no editing was started" in said, repr(said))
+            case.that("a ref no configured remote names cannot be vouched "
+                      "for", "no configured remote names it" in said,
+                      repr(said))
+
+            git.run(["remote", "add", "origin", root])
+            code, said, edited = edit_run("--published")
+            case.that("a remote that is not Azure DevOps cannot be asked",
+                      code == E_PROTECTED and not edited and
+                      "is not on Azure DevOps" in said, repr(said))
+
+            git.run(["remote", "set-url", "origin",
+                     "https://dev.azure.com/some-org/some-project/_git/r"])
+            code, said, edited = edit_run("--published")
+            case.that("without AZURE_DEVOPS_PAT the answer is no",
+                      code == E_PROTECTED and not edited and
+                      "AZURE_DEVOPS_PAT is not set" in said, repr(said))
+
+            os.environ["AZURE_DEVOPS_PAT"] = "never-sent"
+            os.environ["AZURE_DEVOPS_ORG"] = "another-org"
+            code, said, edited = edit_run("--published")
+            case.that("an AZURE_DEVOPS_ORG the remote disagrees with is no",
+                      code == E_PROTECTED and not edited and
+                      "AZURE_DEVOPS_ORG is another-org" in said, repr(said))
         finally:
-            del os.environ[ENV + "FORCE_PUSHABLE"]
-        case.that("--published proceeds when every holder is force-pushable",
-                  code == E_OK and edited, "exit %r: %r" % (code, said))
-        case.that("and the option beats its variable",
-                  "nowhere" not in said, repr(said))
-        git.run(["update-ref", "-d", "refs/remotes/origin/main"])
+            for v in ("AZURE_DEVOPS_PAT", "AZURE_DEVOPS_ORG"):
+                os.environ.pop(v, None)
+            os.environ.update(saved_env)
+            git.run(["update-ref", "-d", "refs/remotes/origin/main"],
+                    check=False)
+            git.run(["remote", "remove", "origin"], check=False)
+
+        case.that("an Azure DevOps URL is read in each of its spellings",
+                  [azure_target(u) for u in (
+                      "https://org@dev.azure.com/org/My%20Project/_git/repo",
+                      "https://org.visualstudio.com/DefaultCollection/"
+                      "My%20Project/_git/repo",
+                      "git@ssh.dev.azure.com:v3/org/My%20Project/repo")] ==
+                  [("org", "My Project", "repo")] * 3)
+        case.that("a URL elsewhere is not taken for Azure DevOps",
+                  azure_target("git@github.com:someone/repo.git") is None)
+        case.that("a branch token encodes each segment as UTF-16LE hex",
+                  azure_branch_token("p", "r", "user/mattc/feature1") ==
+                  "repoV2/p/r/refs/heads/7500730065007200/"
+                  "6d006100740074006300/66006500610074007500720065003100/")
 
         git.run(["tag", "pinned", "HEAD~1"])
         code, said, edited = edit_run()

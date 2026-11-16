@@ -29,7 +29,7 @@ else
 fi
 
 step "bash scripts parse"
-for f in "$HERE/install" "$HERE/test/run"; do
+for f in "$HERE/install" "$HERE/test/run" "$HERE/test/azure-live"; do
     if bash -n "$f"; then good "$(basename "$f")"; else bad "$(basename "$f")"; fi
 done
 
@@ -50,6 +50,17 @@ else bad "the usage text documents$missing, which the parser does not take"; fi
 
 step "the replay changes the message and nothing else"
 if "$HERE/git-reword" --self-test; then good "--self-test"; else bad "--self-test"; fi
+
+step "the force push check against Azure DevOps"
+# Live: needs the AZURE_DEVOPS_* variables and a sandbox prepared by
+# spike/azure-force-push/setup.  Without them it is reported as not run,
+# never as passed.
+"$HERE/test/azure-live"
+case $? in
+    0)  good "test/azure-live" ;;
+    77) printf '   --   not run: test/azure-live needs AZURE_DEVOPS_*\n' ;;
+    *)  bad "test/azure-live" ;;
+esac
 
 step "the installer dry-runs without writing"
 tmp=$(mktemp -d)

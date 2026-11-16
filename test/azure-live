@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+#
+# azure-live - the force push check against a real Azure DevOps repository.
+#
+# --self-test proves every way of not getting the server's answer refuses.
+# What it cannot prove without the server is the rest: that a branch the
+# server lets you force push is let through, and that a denied one and a
+# policy-protected one are refused.  This runs the tool, as delivered, on a
+# clone of the sandbox that spike/azure-force-push/setup prepares:
+#
+#   main, reword-spike/deny and reword-spike/policy share main's tip;
+#   reword-spike/open holds a commit of its own, pushed by the measurement.
+#
+# Needs AZURE_DEVOPS_PAT, AZURE_DEVOPS_ORG, AZURE_DEVOPS_PROJECT and
+# AZURE_DEVOPS_REPO.  Without them it says so and exits 77, which test/run
+# reports as not run.  The token is never printed.
+
+set -uo pipefail
+
+for v in AZURE_DEVOPS_PAT AZURE_DEVOPS_ORG AZURE_DEVOPS_PROJECT AZURE_DEVOPS_REPO; do
+    if [ -z "${!v:-}" ]; then
+        printf 'not run: %s is not set\n' "$v"
+        exit 77
+    fi
+done
+
+TOOL=$(cd "$(dirname "$0")/.." && pwd)/git-reword
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+FAIL=0
+good() { printf '   ok   %s\n' "$1"; }
+bad()  { printf '   FAIL %s\n' "$1"; FAIL=1; }
+
+printf '#!/bin/sh\necho "$AZURE_DEVOPS_PAT"\n' > "$WORK/askpass"
+chmod 700 "$WORK/askpass"
+export GIT_ASKPASS="$WORK/askpass" GIT_TERMINAL_PROMPT=0
+
+enc() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$1"; }
+URL="https://pat@dev.azure.com/$(enc "$AZURE_DEVOPS_ORG")/$(enc "$AZURE_DEVOPS_PROJECT")/_git/$(enc "$AZURE_DEVOPS_REPO")"
+
+git clone --quiet "$URL" "$WORK/r" || { bad "clone"; exit 1; }
+cd "$WORK/r" || exit 1
+git config core.hooksPath "$WORK/no-hooks"
+git branch --quiet open origin/reword-spike/open
+
+shared=$(git rev-parse origin/main)
+own=$(git rev-parse origin/reword-spike/open)
+if git merge-base --is-ancestor "$own" origin/reword-spike/deny; then
+    bad "the fixture is not ready: run spike/azure-force-push/setup, then measure"
+    exit 1
+fi
+
+out=$("$TOOL" --color never --any-author --published -n "$own" -m reworded 2>&1)
+rc=$?
+[ "$rc" = 0 ] && good "a commit only a branch you may force push holds goes through" \
+              || bad "allowed branch refused, exit $rc: $out"
+
+out=$("$TOOL" --color never --any-author -n "$own" -m reworded 2>&1)
+rc=$?
+[ "$rc" = 6 ] && good "and without --published it is still refused as published" \
+              || bad "expected exit 6, got $rc: $out"
+
+out=$("$TOOL" --color never --any-author --published -n "$shared" -m reworded 2>&1)
+rc=$?
+[ "$rc" = 8 ] && good "a commit on a denied or policy-bound branch refuses with --published" \
+              || bad "expected exit 8, got $rc: $out"
+case "$out" in *"reword-spike/deny: Azure DevOps denies you Force push"*)
+    good "the denied branch is named with its reason" ;;
+    *) bad "denied branch not named: $out" ;; esac
+case "$out" in *"reword-spike/policy: a blocking branch policy applies"*)
+    good "the policy-bound branch is named with its reason" ;;
+    *) bad "policy branch not named: $out" ;; esac
+case "$out" in *"on origin/main"*|*", origin/main"*|*"origin/main: "*)
+    bad "main was refused, and it can take a force push: $out" ;;
+    *) good "main, which can take one, is not among the refusals" ;; esac
+
+printf '#!/bin/sh\n: > "%s/editor-ran"\n' "$WORK" > "$WORK/editor"
+chmod 755 "$WORK/editor"
+out=$(GIT_EDITOR="$WORK/editor" "$TOOL" --color never --any-author --published \
+      --edit "$shared~1,$shared" 2>&1)
+rc=$?
+if [ "$rc" = 8 ] && [ ! -e "$WORK/editor-ran" ]; then
+    good "--edit refuses before the editor opens"
+else
+    bad "--edit: exit $rc, editor $( [ -e "$WORK/editor-ran" ] && echo ran || echo idle)"
+fi
+
+exit "$FAIL"
