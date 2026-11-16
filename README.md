@@ -43,6 +43,11 @@ others is how a repository comes to hold two spellings of the same history.
 It copies each ref it moves under `refs/reword-backup/<stamp>/` before moving
 it, and prints the `git update-ref` line that puts each one back.
 
+It says what it is doing as it goes, one line per stage on stderr, with a
+running count through the stages that take a git process per commit or per
+ref. On a terminal the count is redrawn in place; in a log it is written every
+few seconds. `-t` and `-q` silence it.
+
 `-n` prints the plan and writes nothing.
 
 ## The table

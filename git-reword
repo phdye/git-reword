@@ -34,6 +34,7 @@
 # move, and the command that puts each one back is printed.
 
 import argparse
+import io
 import json
 import os
 import re
@@ -155,6 +156,7 @@ class Out(object):
     def __init__(self):
         self.level = 2          # 0 quiet, 1 terse, 2 normal, 3 verbose, 4 debug
         self.color = False
+        self.inline = False     # a progress count is drawn without its newline
 
     def paint(self, text, code):
         if not self.color:
@@ -173,8 +175,16 @@ class Out(object):
     def dim(self, text):
         return self.paint(text, "2")
 
+    def endline(self):
+        """Finish a progress count left open, so the next line does not
+        land on top of it.  The count is redrawn below on its next tick."""
+        if self.inline:
+            sys.stderr.write("\n")
+            self.inline = False
+
     def say(self, text, level=2):
         if self.level >= level:
+            self.endline()
             sys.stderr.write(text + "\n")
 
     def note(self, text):
@@ -182,6 +192,11 @@ class Out(object):
 
     def detail(self, text):
         self.say(text, 3)
+
+    def step(self, text):
+        """One line as a stage of the run begins, so the run is never silent
+        for long.  Normal volume, on stderr; the report stays on stdout."""
+        self.say(self.dim(text), 2)
 
     def trace(self, text):
         self.say(self.dim("  . " + text), 4)
@@ -193,8 +208,63 @@ class Out(object):
 OUT = Out()
 
 
+class Progress(object):
+    """A running count for a stage that spawns a git process per item.  On
+    Cygwin each spawn costs tens of milliseconds, so a few hundred of them
+    with nothing on the screen reads as a hang.
+
+    On a terminal the count is redrawn in place.  Anywhere else -- a pipe, a
+    log, an editor's shell -- a line is written every few seconds, so the
+    record shows the run moving without a line per item.  Normal volume and
+    above; --terse and --quiet see none of it."""
+
+    REDRAW = 0.1
+    EVERY = 3.0
+
+    def __init__(self, label, total):
+        self.label = label
+        self.total = total
+        self.count = 0
+        self.live = OUT.level >= 2 and total > 0
+        self.tty = self.live and sys.stderr.isatty()
+        self.last = time.time()
+        if self.live and not self.tty:
+            sys.stderr.write("%s  0/%d\n" % (label, total))
+        self.draw()
+
+    def draw(self, end=""):
+        if self.tty:
+            sys.stderr.write("\r%s  %d/%d%s" % (self.label, self.count,
+                                                 self.total, end))
+            sys.stderr.flush()
+            OUT.inline = not end
+
+    def tick(self):
+        self.count += 1
+        if not self.live:
+            return
+        now = time.time()
+        if self.tty and now - self.last >= self.REDRAW:
+            self.last = now
+            self.draw()
+        elif not self.tty and now - self.last >= self.EVERY:
+            self.last = now
+            sys.stderr.write("%s  %d/%d\n" % (self.label, self.count,
+                                              self.total))
+
+    def done(self):
+        if not self.live:
+            return
+        if self.tty:
+            self.draw("\n")
+        else:
+            sys.stderr.write("%s  %d/%d\n" % (self.label, self.count,
+                                              self.total))
+
+
 def die(code, message, detail=None):
     """State what went wrong, then what a reader needs to find the cause."""
+    OUT.endline()
     sys.stderr.write(OUT.bad("%s: " % PROG) + message + "\n")
     if detail:
         for line in detail:
@@ -581,7 +651,11 @@ def build_plan(git, top, wanted, opt):
         plan.target_order.append(sha)
 
     refs = local_refs(git)
+    progress = Progress("finding the local refs that stand on %d commit%s"
+                        % (len(plan.targets),
+                           "" if len(plan.targets) == 1 else "s"), len(refs))
     for name, sha, annotated in refs:
+        progress.tick()
         if not any(contains(git, sha, t) for t in plan.targets):
             continue
         if opt.refs and not any(glob_match(p, name) for p in opt.refs):
@@ -591,6 +665,7 @@ def build_plan(git, top, wanted, opt):
             plan.tags.append((name, sha, annotated))
         else:
             plan.branches.append((name, sha))
+    progress.done()
 
     if not git.text(["symbolic-ref", "--quiet", "HEAD"], check=False):
         head = git.text(["rev-parse", "HEAD"])
@@ -609,6 +684,7 @@ def check(git, top, plan, opt):
              if opt.refs else
              "the commits may be reachable only from a remote-tracking ref"])
 
+    OUT.step("checking worktrees, tags and authors")
     held = other_worktree_branches(git, top)
     blocked = [(n, held[n]) for n, _ in plan.branches if n in held]
     if blocked:
@@ -643,10 +719,19 @@ def check(git, top, plan, opt):
 
     published = []
     remotes = remote_refs(git)
+    progress = Progress("checking %d remote-tracking ref%s for published "
+                        "commits" % (len(remotes),
+                                     "" if len(remotes) == 1 else "s"),
+                        len(remotes) * len(plan.target_order))
     for sha in plan.target_order:
-        holders = [r for r in remotes if contains(git, r, sha)]
+        holders = []
+        for ref in remotes:
+            progress.tick()
+            if contains(git, ref, sha):
+                holders.append(ref)
         if holders:
             published.append((sha, holders))
+    progress.done()
     if published and not opt.published:
         detail = []
         for sha, holders in published:
@@ -668,6 +753,7 @@ def walk(git, plan):
     tips = [sha for _, sha in plan.branches] + [s for _, s, _ in plan.tags]
     if plan.detached:
         tips.append(plan.detached)
+    OUT.step("walking the history that stands on them")
     cut = exclusions(git, plan.target_order)
     args = ["rev-list", "--topo-order", "--reverse", "--parents"] + tips
     if cut:
@@ -691,18 +777,24 @@ def walk(git, plan):
         if sha in plan.targets or any(p in dirty for p in parents[sha]):
             dirty.add(sha)
     plan.dirty = [s for s in plan.order if s in dirty]
+    OUT.step("%d commit%s to write again, %d of them reworded"
+             % (len(plan.dirty), "" if len(plan.dirty) == 1 else "s",
+                len(plan.targets)))
     plan.commits.update(read_commits(
         git, [s for s in plan.dirty if s not in plan.commits]))
     return plan
 
 
 def apply(git, plan, stamp):
+    progress = Progress("writing commits", len(plan.dirty))
     for sha in plan.dirty:
         commit = plan.commits[sha]
         new_parents = [plan.mapping.get(p, p) for p in commit.parents]
         new = rebuild(git, commit, new_parents, plan.targets.get(sha))
         plan.mapping[sha] = new
+        progress.tick()
         OUT.trace("%s -> %s  %s" % (sha[:12], new[:12], commit.subject()))
+    progress.done()
 
     commands = []
     moved = []
@@ -724,6 +816,8 @@ def apply(git, plan, stamp):
             moved.append(("HEAD", old, new))
 
     if commands:
+        OUT.step("moving %d ref%s, backing up the old values"
+                 % (len(moved), "" if len(moved) == 1 else "s"))
         git.raw(["update-ref", "--stdin"],
                 stdin=("\n".join(commands) + "\n").encode("ascii"))
     return moved
@@ -881,7 +975,9 @@ def changed_only(git, pairs):
     unchanged entry is not a no-op rewrite, it is a commit to leave alone --
     rewriting it would change its id for nothing."""
     wanted = []
+    progress = Progress("comparing messages", len(pairs))
     for abbrev, message in pairs:
+        progress.tick()
         sha = resolve(git, abbrev)
         commit = read_commits(git, [sha])[sha]
         if commit.message().strip("\n") == message.strip("\n"):
@@ -889,6 +985,7 @@ def changed_only(git, pairs):
                        % (sha[:12], commit.subject()))
             continue
         wanted.append((sha, message))
+    progress.done()
     return wanted
 
 
@@ -1028,6 +1125,8 @@ def gather(git, opt):
                             "REWORD_TODO")
         with open(path, "w") as handle:
             handle.write(render_table(commits, shas))
+        OUT.step("%d commit%s in the table; waiting for the editor to close"
+                 % (len(shas), "" if len(shas) == 1 else "s"))
         editor_on(git, path)
         with open(path, "r") as handle:
             return changed_only(git, parse_table(handle.read()))
@@ -1304,6 +1403,29 @@ def self_test():
         trees_after = sorted(read_commits(git, [s])[s].tree for s in
                              git.lines(["rev-list", "main"]))
         case.that("and every tree survives it", trees_before == trees_after)
+
+        # At normal volume the run says what it is doing as it does it, or a
+        # long replay on Cygwin reads as a hang.  -q says nothing.
+        def stderr_of(args):
+            loud = sys.stderr
+            sys.stderr = io.StringIO()
+            try:
+                main(args)
+                return sys.stderr.getvalue()
+            finally:
+                sys.stderr = loud
+                OUT.level = saved
+        said = stderr_of(["-C", root, "--color", "never", "-o", os.devnull,
+                          "HEAD", "-m", "spoken"])
+        case.that("a run at normal volume reports each stage",
+                  all(s in said for s in ("finding the local refs",
+                                          "checking worktrees",
+                                          "walking the history",
+                                          "writing commits",
+                                          "moving ")), repr(said))
+        said = stderr_of(["-C", root, "-q", "-o", os.devnull,
+                          "HEAD", "-m", "unspoken"])
+        case.that("and -q reports nothing", said == "", repr(said))
     finally:
         OUT.level = saved
         shutil.rmtree(root, ignore_errors=True)

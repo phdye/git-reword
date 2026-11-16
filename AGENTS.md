@@ -74,6 +74,16 @@ need not drag everything between them into the table. A string with a comma
 that resolves whole is taken as one revision, since a ref name may hold a
 comma.
 
+## It is never silent for long
+
+Finding refs, checking for published commits and writing the replay each
+spawn a git process per item, and on Cygwin a few hundred of those with
+nothing on the screen reads as a hang. So at normal volume every stage
+announces itself with `OUT.step`, and each per-item loop runs a `Progress`
+count: redrawn in place on a terminal, a line every few seconds anywhere else.
+All of it goes to stderr, so the report on stdout and `--json` stay clean, and
+`-t` and `-q` drop it. A new loop that spawns git per item gets a `Progress`.
+
 ## Working on it
 
 Run `./test/run` before committing. It builds a repository with a merge and a
