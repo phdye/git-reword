@@ -4,6 +4,7 @@ Change the message of a commit that is already written.
 
     git reword <commit> -m "the message it should have had"
     git reword --edit HEAD~8
+    git reword --edit 3f2a91c,8be0d47,HEAD~12,c41f7aa   # just these four
     git reword --list HEAD~8 -o todo.txt   # edit it, then
     git reword --from todo.txt
 
@@ -57,6 +58,11 @@ that commit; leave it alone, or delete the entry, and that commit is untouched.
 
 Comparison is exact, trailing whitespace included, so a commit nobody edited is
 never reworded to the same text under a new id.
+
+Given a range, the table offers every commit in it. Given commits separated by
+commas, in any order, it offers those and nothing between them, oldest first,
+which is the way to reword four commits scattered through fifty. All of them
+are reworded in one replay.
 
 ## Install
 

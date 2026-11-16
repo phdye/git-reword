@@ -58,9 +58,9 @@ E_TAG = 7
 USAGE = """\
 Usage:
   git-reword [options] COMMIT (-m MSG | -F FILE)
-  git-reword [options] --edit [RANGE]
+  git-reword [options] --edit [RANGE | COMMITS]
   git-reword [options] --from FILE
-  git-reword --list [options] [RANGE]
+  git-reword --list [options] [RANGE | COMMITS]
   git-reword --self-test
   git-reword (-h | --help)
   git-reword (-V | --version)
@@ -74,6 +74,9 @@ Arguments:
   COMMIT               The commit to reword; anything git resolves
   RANGE                Which commits to offer for rewording
                        [default: @{upstream}..HEAD]
+  COMMITS              Commits to offer one by one, comma separated, in any
+                       order: a1b2c3d,HEAD~7,f00ba4.  The table lists them
+                       oldest first and nothing between them.
   FILE                 A message file, or a table; '-' is stdin
 
 Options:
@@ -797,10 +800,43 @@ def report(plan, moved, stamp, opt, write):
 
 # ------------------------------------------------------------------- modes
 
+def listed_commits(git, rng):
+    """The commits a comma-separated list names, oldest first, or None when
+    RNG is not a list.  A ref name may legally hold a comma, so a string that
+    resolves whole is taken as the one revision it names."""
+    if "," not in rng:
+        return None
+    if git.ok(["rev-parse", "--verify", "--quiet", "%s^{commit}" % rng]):
+        return None
+    names = [name.strip() for name in rng.split(",") if name.strip()]
+    if not names:
+        die(E_USAGE, "the commit list names no commits", ["it was: " + rng])
+    for name in names:
+        if ".." in name:
+            die(E_USAGE, "a commit list takes commits, not ranges",
+                ["it was given: " + name,
+                 "give one range on its own, or list the commits"])
+    shas = []
+    for name in names:
+        sha = resolve(git, name)
+        if sha not in shas:
+            shas.append(sha)
+    # Topological rather than by date: a rebased commit can carry a date
+    # older than its parent's, and the table should read the way history
+    # does.  The walk reaches every listed commit, since each one starts it.
+    rank = dict((sha, i) for i, sha in enumerate(
+        git.lines(["rev-list", "--topo-order", "--reverse"] + shas)))
+    return sorted(shas, key=lambda sha: rank[sha])
+
+
 def range_commits(git, rng):
     """Oldest first, the way a rebase todo reads.  A bare revision is taken
     as its exclusive lower bound, which is the habit git rebase already
-    teaches: 'git reword --edit HEAD~5' offers the last five."""
+    teaches: 'git reword --edit HEAD~5' offers the last five.  A comma list
+    offers exactly the commits it names."""
+    listed = listed_commits(git, rng)
+    if listed is not None:
+        return listed
     if ".." not in rng:
         rng = "%s..HEAD" % rng
     shas = git.lines(["rev-list", "--reverse", rng])
@@ -1237,6 +1273,37 @@ def self_test():
         case.that("a trailing space survives the table",
                   changed_only(git, parse_table(table)) == [],
                   "an unedited entry came back as edited")
+
+        # Commits that are not adjacent, named out of order: the table holds
+        # those two and nothing between them, oldest first, and rewording
+        # both in one pass leaves every tree where it was.
+        third = git.text(["rev-parse", "HEAD~2"])
+        listed = range_commits(git, "HEAD~2, %s" % sha["first"][:10])
+        case.that("a commit list offers exactly its commits, oldest first",
+                  listed == [sha["first"], third], repr(listed))
+        git.run(["branch", "has,comma", sha["first"]])
+        case.that("a ref whose name holds a comma is still one revision",
+                  listed_commits(git, "has,comma") is None)
+        trees_before = sorted(read_commits(git, [s])[s].tree for s in
+                              git.lines(["rev-list", "main"]))
+        table = render_table(read_commits(git, listed), listed)
+        table = (table.replace("    first\n", "    first, reworded\n")
+                 .replace("    third\n", "    third, reworded\n"))
+        todo = os.path.join(root, "todo")
+        with open(todo, "w") as handle:
+            handle.write(table)
+        OUT.level = 0
+        rc = main(["-C", root, "-q", "--any-author", "--from", todo])
+        OUT.level = saved
+        subjects = git.text(["log", "--format=%s", "main"]).split("\n")
+        case.that("both listed commits are reworded in one pass",
+                  rc == E_OK and "first, reworded" in subjects
+                  and "third, reworded" in subjects
+                  and "first" not in subjects and "third" not in subjects,
+                  "rc %d" % rc)
+        trees_after = sorted(read_commits(git, [s])[s].tree for s in
+                             git.lines(["rev-list", "main"]))
+        case.that("and every tree survives it", trees_before == trees_after)
     finally:
         OUT.level = saved
         shutil.rmtree(root, ignore_errors=True)

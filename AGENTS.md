@@ -68,6 +68,12 @@ whitespace. Azure DevOps writes a trailing space on every subject it generates,
 and a table that trimmed one reported the commit as edited and reworded it for
 nothing. There is a check for it in `--self-test`.
 
+`--edit` and `--list` take a range or a comma-separated list of commits. A list
+offers exactly the commits it names, in topological order, so commits far apart
+need not drag everything between them into the table. A string with a comma
+that resolves whole is taken as one revision, since a ref name may hold a
+comma.
+
 ## Working on it
 
 Run `./test/run` before committing. It builds a repository with a merge and a
