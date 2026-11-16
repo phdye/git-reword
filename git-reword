@@ -143,7 +143,8 @@ Environment:
 
   AZURE_DEVOPS_PAT     The token the permission check asks Azure DevOps with
   AZURE_DEVOPS_ORG, AZURE_DEVOPS_PROJECT, AZURE_DEVOPS_REPO
-                       Where set, each must agree with the remote's own URL
+                       Where set, each must agree with the remote's own URL,
+                       percent-encoded or not
 
 Exit codes:
   0  the rewrite ran, or --dry-run printed a plan
@@ -848,6 +849,20 @@ def azure_target(url):
     return None
 
 
+def azure_disagreements(target, environ):
+    """[(variable, its value, the URL's part)] for each AZURE_DEVOPS_* value
+    that names something other than the remote's URL does.
+
+    azure_target percent-decodes the URL's parts, so a variable is decoded
+    too: "My%20Project" and "My Project" are one project spelled twice."""
+    from urllib.parse import unquote
+    return [(var, environ[var], have) for var, have in
+            zip(("AZURE_DEVOPS_ORG", "AZURE_DEVOPS_PROJECT",
+                 "AZURE_DEVOPS_REPO"), target)
+            if environ.get(var) and
+            unquote(environ[var]).lower() != have.lower()]
+
+
 def azure_branch_token(project_id, repo_id, branch):
     """The branch's token in the Git Repositories security namespace: each
     path segment of the name as UTF-16LE hex."""
@@ -959,11 +974,7 @@ def force_push_verdicts(git, holders):
                                "it can take a force push cannot be read"
                         % remote)
             continue
-        wrong = [(var, os.environ[var], have) for var, have in
-                 zip(("AZURE_DEVOPS_ORG", "AZURE_DEVOPS_PROJECT",
-                      "AZURE_DEVOPS_REPO"), target)
-                 if os.environ.get(var) and
-                 os.environ[var].lower() != have.lower()]
+        wrong = azure_disagreements(target, os.environ)
         if wrong:
             out[ref] = (False, "; ".join("%s is %s but remote %s says %s"
                                          % (v, e, remote, h)
@@ -1781,6 +1792,22 @@ def self_test():
                       "My%20Project/_git/repo",
                       "git@ssh.dev.azure.com:v3/org/My%20Project/repo")] ==
                   [("org", "My Project", "repo")] * 3)
+        # A project with a space in its name is percent-encoded in the URL
+        # and may be either way in the variable.  One that was encoded was
+        # once refused as disagreeing with its own remote.
+        spaced = azure_target(
+            "https://org@dev.azure.com/org/My%20Project/_git/repo")
+        for value in ("My%20Project", "My Project", "my%20project"):
+            case.that("AZURE_DEVOPS_PROJECT %r agrees with My%%20Project in "
+                      "the URL" % value,
+                      azure_disagreements(
+                          spaced, {"AZURE_DEVOPS_PROJECT": value}) == [])
+        case.that("a different project disagrees, and is reported as it "
+                  "was set",
+                  azure_disagreements(
+                      spaced, {"AZURE_DEVOPS_PROJECT": "Other%20Project"}) ==
+                  [("AZURE_DEVOPS_PROJECT", "Other%20Project",
+                    "My Project")])
         case.that("a URL elsewhere is not taken for Azure DevOps",
                   azure_target("git@github.com:someone/repo.git") is None)
         case.that("a branch token encodes each segment as UTF-16LE hex",
