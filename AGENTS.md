@@ -42,6 +42,14 @@ A commit a remote-tracking branch already holds. Publishing that rewrite takes
 a force push, and that is the operator's decision, not a tool's. `--published`
 rewrites locally and still pushes nothing; nothing in here pushes anything.
 
+A commit held by a remote-tracking branch that cannot take a force push. This
+one has no flag, `--published` included: the rewrite could never be
+published, so the local history would part from the remote's for good. The
+tool cannot read a remote's permissions, so a branch counts as force-pushable
+only when declared (`git config reword.forcePushable`, `--force-pushable`,
+`GIT_REWORD_FORCE_PUSHABLE`), and anything undeclared is protected. Exit 8.
+Symbolic remote refs such as `origin/HEAD` are not holders in their own right.
+
 A branch another worktree has checked out. Moving the ref leaves that
 worktree's index describing a commit its branch no longer names, and git then
 reports the whole tree as changed.

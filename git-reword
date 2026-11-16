@@ -28,7 +28,9 @@
 # a message badly worded.  A commit a remote-tracking branch already holds is
 # not reworded either, because publishing that rewrite takes a force push, and
 # that is the operator's call rather than a tool's.  Each has a flag, and
-# neither flag pushes anything.
+# neither flag pushes anything.  A commit held by a branch that cannot take a
+# force push at all has no flag: rewording it would part the local history
+# from the remote's for good.
 #
 # Every ref it moves is copied under refs/reword-backup/<stamp>/ before the
 # move, and the command that puts each one back is printed.
@@ -55,6 +57,7 @@ E_WORKTREE = 4
 E_AUTHOR = 5
 E_PUBLISHED = 6
 E_TAG = 7
+E_PROTECTED = 8
 
 USAGE = """\
 Usage:
@@ -95,6 +98,12 @@ Options:
                        Publishing them afterwards takes a force push, which
                        this tool does not do and will not help with.
       --no-published
+      --force-pushable PATTERN
+                       A remote-tracking branch that can take a force push,
+                       as remote/branch; a glob; repeatable.  Replaces
+                       git config reword.forcePushable, which is where the
+                       list normally lives.  A published commit is reworded
+                       only when every branch holding it matches.
       --skip-tags      Leave a tag standing on the old history rather than
                        refusing to run
       --no-skip-tags
@@ -132,7 +141,7 @@ Environment:
   GIT_REWORD_REFS, GIT_REWORD_ANY_AUTHOR, GIT_REWORD_PUBLISHED,
   GIT_REWORD_SKIP_TAGS, GIT_REWORD_DIRECTORY, GIT_REWORD_DRY_RUN,
   GIT_REWORD_COLOR, GIT_REWORD_VERBOSE, GIT_REWORD_TERSE, GIT_REWORD_QUIET,
-  GIT_REWORD_DEBUG.  An option beats its variable, a variable beats the
+  GIT_REWORD_DEBUG, GIT_REWORD_FORCE_PUSHABLE (comma separated).  An option beats its variable, a variable beats the
   default.  GIT_EDITOR, VISUAL and EDITOR select the editor for --edit, in
   that order.
 
@@ -145,6 +154,18 @@ Exit codes:
   5  a commit belongs to another author
   6  a commit is already published
   7  a tag stands on a commit being reworded
+  8  a commit is held by a branch not declared force-pushable
+
+Branches that cannot take a force push:
+  A commit any remote-tracking branch holds is refused unless every branch
+  holding it is declared force-pushable, and no option gets past that: once
+  rewritten, such a commit could never be published, and the local history
+  would part from the remote's for good.  What is not declared is taken as
+  protected, since the remote's permissions cannot be read from here.
+  Declare them per repository:
+    git config --add reword.forcePushable 'origin/integration/*'
+  The check reads the remote-tracking refs as of the last fetch, so fetch
+  first.  With --edit it runs before the editor opens.
 """
 
 
@@ -560,7 +581,16 @@ def local_refs(git):
 
 
 def remote_refs(git):
-    return git.lines(["for-each-ref", "--format=%(refname)", "refs/remotes"])
+    """The remote-tracking branches.  A symbolic one such as origin/HEAD is
+    left out: it names a branch already in the list, and as a holder of its
+    own it could only ever read as one more protected branch."""
+    out = []
+    for line in git.lines(["for-each-ref", "--format=%(refname) %(symref)",
+                           "refs/remotes"]):
+        name, _, target = line.partition(" ")
+        if not target.strip():
+            out.append(name)
+    return out
 
 
 def contains(git, tip, sha):
@@ -744,6 +774,27 @@ def check(git, top, plan, opt, before_edit=False):
         if holders:
             published.append((sha, holders))
     progress.done()
+    patterns = force_pushable(git, opt)
+    locked = []
+    for sha, holders in published:
+        fixed = [h for h in holders if not pushable(h, patterns)]
+        if fixed:
+            locked.append((sha, fixed))
+    if locked:
+        # Not an option's to waive.  A rewrite of a commit such a branch
+        # holds can never be published, so the local history would part
+        # from the remote's for good.
+        refuse(E_PROTECTED,
+               "a commit being reworded is on a branch that cannot be "
+               "force pushed",
+               ["%s  on %s" % (sha[:12], ", ".join(short_remote(r)
+                                                   for r in fixed))
+                for sha, fixed in locked] +
+               ["no option gets past this; leave these commits out",
+                "a branch counts as force-pushable only when declared:",
+                "  git config --add reword.forcePushable 'REMOTE/BRANCH'",
+                "declared now: " + (", ".join(patterns) or "nothing")])
+
     if published and not opt.published:
         detail = []
         for sha, holders in published:
@@ -752,10 +803,31 @@ def check(git, top, plan, opt, before_edit=False):
             detail +
             ["the remote holds the old id, so publishing the new one takes a",
              "force push; this tool does not force push and will not help",
-             "--published rewrites locally anyway, and still pushes nothing"])
+             "every branch holding them is declared force-pushable, so",
+             "--published rewrites locally, and still pushes nothing"])
     if published and opt.published:
         OUT.warn("rewriting published commits; the remote keeps the old ids "
                  "until you force push, which is yours to decide")
+
+
+def force_pushable(git, opt):
+    """The remote-tracking branches declared able to take a force push:
+    the option, else its variable, else git config reword.forcePushable."""
+    if opt.force_pushable is not None:
+        return opt.force_pushable
+    return git.lines(["config", "--get-all", "reword.forcePushable"],
+                     check=False)
+
+
+def short_remote(ref):
+    prefix = "refs/remotes/"
+    return ref[len(prefix):] if ref.startswith(prefix) else ref
+
+
+def pushable(ref, patterns):
+    import fnmatch
+    name = short_remote(ref)
+    return any(fnmatch.fnmatchcase(name, p) for p in patterns)
 
 
 def walk(git, plan):
@@ -1049,6 +1121,8 @@ def build_parser():
                         action="store_true", default=None)
     parser.add_argument("--no-published", dest="published",
                         action="store_false")
+    parser.add_argument("--force-pushable", dest="force_pushable",
+                        action="append", default=None)
     parser.add_argument("--skip-tags", dest="skip_tags",
                         action="store_true", default=None)
     parser.add_argument("--no-skip-tags", dest="skip_tags",
@@ -1115,6 +1189,13 @@ def settle_all(opt):
     if opt.refs is None:
         from_env = env_str("REFS")
         opt.refs = [p for p in from_env.split(",") if p] if from_env else []
+    if opt.force_pushable is None:
+        # None, not empty, means neither was given and the repository's
+        # git config decides; check() reads it once the repository is open.
+        from_env = env_str("FORCE_PUSHABLE")
+        if from_env is not None:
+            opt.force_pushable = [p.strip() for p in from_env.split(",")
+                                  if p.strip()]
     if opt.directory is None:
         opt.directory = env_str("DIRECTORY")
     if opt.output is None:
@@ -1468,7 +1549,7 @@ def self_test():
                          % marker)
         os.chmod(editor, 0o755)
 
-        def edit_run():
+        def edit_run(*extra):
             if os.path.exists(marker):
                 os.remove(marker)
             old_editor = os.environ.get("GIT_EDITOR")
@@ -1477,7 +1558,8 @@ def self_test():
             sys.stderr = io.StringIO()
             try:
                 code = main(["-C", root, "--color", "never", "-o", os.devnull,
-                             "--any-author", "--edit", "HEAD~2"])
+                             "--any-author"] + list(extra) +
+                            ["--edit", "HEAD~2"])
             except SystemExit as stop:
                 code = stop.code
             finally:
@@ -1491,6 +1573,7 @@ def self_test():
             return code, said, os.path.exists(marker)
 
         git.run(["update-ref", "refs/remotes/origin/main", "HEAD~1"])
+        git.run(["config", "reword.forcePushable", "origin/*"])
         code, said, edited = edit_run()
         case.that("--edit over a published commit refuses with its code",
                   code == E_PUBLISHED, "exit %r" % (code,))
@@ -1501,6 +1584,34 @@ def self_test():
                   said.index("already published"), repr(said))
         case.that("and the refusal says no editing was started",
                   "no editing was started" in said, repr(said))
+
+        # A branch that cannot take a force push is a hard stop: no option
+        # gets past it, and it is found before the editor opens.  What is
+        # not declared force-pushable is taken to be protected.
+        git.run(["update-ref", "refs/remotes/origin/develop", "HEAD~1"])
+        git.run(["config", "reword.forcePushable", "origin/main"])
+        code, said, edited = edit_run("--published")
+        case.that("a commit on a protected branch refuses even with "
+                  "--published", code == E_PROTECTED, "exit %r" % (code,))
+        case.that("and names the branch, before the editor opens",
+                  "origin/develop" in said and not edited, repr(said))
+        git.run(["update-ref", "-d", "refs/remotes/origin/develop"])
+
+        git.run(["config", "--unset-all", "reword.forcePushable"])
+        code, said, edited = edit_run("--published")
+        case.that("with nothing declared, every branch counts as protected",
+                  code == E_PROTECTED and not edited, "exit %r" % (code,))
+
+        os.environ[ENV + "FORCE_PUSHABLE"] = "nowhere/*"
+        try:
+            code, said, edited = edit_run("--published",
+                                          "--force-pushable", "origin/m*")
+        finally:
+            del os.environ[ENV + "FORCE_PUSHABLE"]
+        case.that("--published proceeds when every holder is force-pushable",
+                  code == E_OK and edited, "exit %r: %r" % (code, said))
+        case.that("and the option beats its variable",
+                  "nowhere" not in said, repr(said))
         git.run(["update-ref", "-d", "refs/remotes/origin/main"])
 
         git.run(["tag", "pinned", "HEAD~1"])

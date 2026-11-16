@@ -76,6 +76,21 @@ refusal comes before any editing rather than after it. A published commit in
 the table refuses even if you meant to leave it alone; narrow the selection,
 or pass `--published`.
 
+## Published commits
+
+A commit a remote-tracking branch holds needs `--published`, and even then only
+when every branch holding it can take a force push. Declare those per
+repository, then fetch so the remote-tracking refs are current:
+
+    git config --add reword.forcePushable 'origin/integration/*'
+    git config --add reword.forcePushable 'origin/fix/*'
+    git fetch --prune
+    git reword --published --edit a1b2c3d,e4f5a6b
+
+A commit on any branch not declared, `origin/main` or `origin/develop` say, is
+refused with exit 8 before the editor opens, and no option gets past that.
+Nothing is pushed; the force push afterwards is yours.
+
 ## Install
 
     ./install
